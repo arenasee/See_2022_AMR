@@ -1,0 +1,1111 @@
+---
+title: "tetW_analysis"
+author: "Arena See"
+date: '2022-05-22'
+output: html_document
+---
+#loading packages in
+```{r ,echo=TRUE}
+###to load packages which are not installed use function install.packages("") or BiocManager::install("")
+library("BiocManager")
+library("import")
+library("knitr")
+library("BiocStyle")
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+library("phyloseq")
+library("DECIPHER")
+library("ape")
+library("phangorn")
+library("ShortRead")
+library("pairwiseAdonis")
+library("kableExtra")
+library("ggplot2"); packageVersion("ggplot2")
+library("plyr"); packageVersion("plyr")
+library("data.table"); packageVersion("data.table")
+library( "DESeq2" )
+library("ggrepel")
+library("cowplot")
+library("ggpubr")
+library("pheatmap")
+library("microbiome")
+library("scales")
+set.seed(711L)
+```
+
+#make sure 'True' is your output
+```{r ,echo=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library("knitr")
+library("BiocStyle")
+.cran_packages <- c("ggplot2", "gridExtra")
+.bioc_packages <- c("dada2", "phyloseq", "DECIPHER", "phangorn")
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+   source("http://bioconductor.org/biocLite.R")
+   biocLite(.bioc_packages[!.inst], ask = F)
+}
+# Load packages into session, and print package version
+sapply(c(.cran_packages, .bioc_packages), require, character.only = TRUE)
+```
+
+############################### SETTING COLOR PALETTE FOR PLOTS ######################
+```{r}
+plotTextSize = 9
+legTextSize = 7
+theme_set(theme_bw() + 
+            theme(text = element_text(size = plotTextSize),
+                  legend.text = element_text(size = legTextSize),
+                  legend.position = "top",
+                  legend.direction = "horizontal",
+                  legend.margin = margin(t = 0, b = -0.75, unit='line'),
+                  axis.title.x = element_text(margin=margin(0.3, 0, 0, 0, unit = "lines")),
+                  axis.title.y = element_text(margin=margin(0, 0.3, 0, 0, unit = "lines")),
+                  panel.spacing = margin(t = 0, unit='line'),
+                  plot.margin = unit(x = c(0.25, 0.2, 0.5, 0.1),
+                                     units="line")
+            )
+)
+tumorPalette = c(Healthy = "chartreuse4",
+                 Tumor = "lightgray")
+
+library(wesanderson)
+pal <- wes_palette("Zissou1", 100, type = "continuous")
+pal2 <- wes_palette("Cavalcanti1",100,type="continuous")
+pal3 <- c(wes_palette("Royal1", type = "discrete"),
+          wes_palette("Chevalier1", type = "discrete"),
+          wes_palette("FantasticFox1",type = "discrete"),
+          wes_palette("IsleofDogs1", type = "discrete"),
+          wes_palette("BottleRocket1", type = "discrete"),
+          wes_palette("Rushmore1", type = "discrete"),
+          wes_palette("Darjeeling1", type = "discrete"),
+          wes_palette("Moonrise1", type = "discrete"),
+          wes_palette("GrandBudapest1", type = "discrete"),
+          wes_palette("Cavalcanti1", type = "discrete"))
+```
+
+###################### FUNCTIONS USED IN ANALYSIS ################################
+```{r}
+#setting custom geometric mean function with zero/NA tolerance
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+#phyloseq_clr code
+library(compositions)
+zero_comp = function(x){
+  if(taxa_are_rows(x)){x <- t(x)}
+  matx = otu_table(x)
+  # `zCompositions::cmultRepl` expects the samples to be in rows and OTUs to be in columns 
+  matxzc = zCompositions::cmultRepl(matx, method="CZM", output="counts")
+  otu_table(x) <- otu_table(matxzc, taxa_are_rows = FALSE)
+  return(x)
+}
+
+# CLR definition
+geometric_mean = function(x){
+  exp(mean(log(x)))
+}
+clr = function(x, base=2){
+  x <- log((x / geometric_mean(x)), base)
+}
+phyloseq_CLR = function(physeq){
+  suppressMessages({physeq <- zero_comp(physeq)})
+  return(transform_sample_counts(physeq, fun = clr))
+}
+```
+
+#function for plot table of significant values
+```{r}
+plot_deseq = function(dsdf, alpha = 0.1){
+  # Phylum order
+  x = tapply(dsdf$log2FoldChange, dsdf$Phylum, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Phylum <- factor(as.character(dsdf$Phylum), levels=names(x))
+  # Genus order
+  x = tapply(dsdf$log2FoldChange, dsdf$Genus, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Genus <- factor(as.character(dsdf$Genus), levels=names(x))
+  # Define the special points worth highlighting
+  specialdf = dsdf[(dsdf$pvalue < alpha), ]
+  specialdf$OTU <- row.names(specialdf)
+  # Now define the ggplot2 object.
+  p = ggplot(
+    data = dsdf, 
+    mapping = aes(x = log2FoldChange,
+                  y = -log10(pvalue),
+                  size = -log10(pvalue))
+    ) + 
+    geom_vline(xintercept = 0.0, linetype = 2) +
+      # the background of all results
+    geom_point(color = "black", alpha = 0.65) + 
+      # the few interesting, borderline significant results
+    geom_point(data = specialdf,
+               mapping = aes(color = Family)) +
+    geom_text_repel(data = specialdf,
+                    mapping = aes(label = paste(OTU, Genus))) +
+    scale_size_continuous(range = c(1, 4)) +
+    guides(size=FALSE) +
+    # axis labels
+    labs(y = expression(-log[10](p)),
+         x = expression(log[2](FC)))
+  return(p)
+}
+```
+
+#function to convert phyloseq object to ampvis2 object
+```{r}
+phyloseq_to_ampvis2 <- function(physeq) {
+  #check object for class
+  if(!any(class(physeq) %in% "phyloseq"))
+    stop("physeq object must be of class \"phyloseq\"", call. = FALSE)
+  
+  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
+  if(is.null(physeq@tax_table))
+    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = FALSE)
+  
+  #OTUs must be in rows, not columns
+  if(phyloseq::taxa_are_rows(physeq))
+    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
+  else
+    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
+  
+  #tax_table is assumed to have OTUs in rows too
+  tax <- phyloseq::tax_table(physeq)@.Data
+  
+  #merge by rownames (OTUs)
+  otutable <- merge(
+    abund,
+    tax,
+    by = 0,
+    all.x = TRUE,
+    all.y = FALSE,
+    sort = FALSE
+  )
+  colnames(otutable)[1] <- "OTU"
+  
+  #extract sample_data (metadata)
+  if(!is.null(physeq@sam_data)) {
+    metadata <- data.frame(
+      phyloseq::sample_data(physeq),
+      row.names = phyloseq::sample_names(physeq), 
+      stringsAsFactors = FALSE, 
+      check.names = FALSE
+    )
+    
+    #check if any columns match exactly with rownames
+    #if none matched assume row names are sample identifiers
+    samplesCol <- unlist(lapply(metadata, function(x) {
+      identical(x, rownames(metadata))}))
+    
+    if(any(samplesCol)) {
+      #error if a column matched and it's not the first
+      if(!samplesCol[[1]])
+        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = FALSE)
+    } else {
+      #assume rownames are sample identifiers, merge at the end with name "SampleID"
+      if(any(colnames(metadata) %in% "SampleID"))
+        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = FALSE)
+      metadata$SampleID <- rownames(metadata)
+      
+      #reorder columns so SampleID is the first
+      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = FALSE]
+    }
+  } else
+    metadata <- NULL
+  
+  #extract phylogenetic tree, assumed to be of class "phylo"
+  if(!is.null(physeq@phy_tree)) {
+    tree <- phyloseq::phy_tree(physeq)
+  } else
+    tree <- NULL
+  
+  #extract OTU DNA sequences, assumed to be of class "XStringSet"
+  if(!is.null(physeq@refseq)) {
+    #convert XStringSet to DNAbin using a temporary file (easiest)
+    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
+    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
+  } else
+    fastaTempFile <- NULL
+  
+  #load as normally with amp_load
+  ampvis2::amp_load(
+    otutable = otutable,
+    metadata = metadata,
+    tree = tree,
+    fasta = fastaTempFile
+  )
+}
+```
+
+#################################### DADA2 FILTRATION PIPELINE #####################################
+```{r}
+TetW_fastq_files <- "/Volumes/AESexternal/AMR/TetW_5_20_22/TetW_redo_AES-350564332/TetW_fastq" #list directory where fastq files are 
+list.files(TetW_fastq_files) #listing fastq files
+saveRDS(TetW_fastq_files, "TetW_fastq_files.RDS")
+#TetW_fastq_files <- readRDS("TetW_fastq_files.RDS")
+```
+
+#filtering and trimming files
+```{r}
+TetW_fnFs <- sort(list.files(TetW_fastq_files, pattern="_L001_R1_001.fastq.gz")) #forward reads
+TetW_fnRs <- sort(list.files(TetW_fastq_files, pattern="_L001_R2_001.fastq.gz")) #reverse reads
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sampleNames <- sapply(strsplit(TetW_fnFs, "_"), `[`, 1)
+# Specify the full path to the fnFs and fnRs
+TetW_fnFs <- file.path(TetW_fastq_files, TetW_fnFs)
+TetW_fnRs <- file.path(TetW_fastq_files, TetW_fnRs)
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(TetW_fnFs), "_"), `[`, 1)
+TetW_fnFs[1:3]
+TetW_fnRs[1:3]
+```
+
+#looking at Q scores - forward
+```{r}
+plotQualityProfile(TetW_fnFs[1:5])
+```
+
+#looking at Q scores - reverse
+```{r}
+plotQualityProfile(TetW_fnRs[1:5])
+```
+
+trimming and filtering F/R reads
+```{r}
+TetW_filt_path <- file.path(TetW_fastq_files, "TetW_filtered") 
+if(!file_test("-d", TetW_filt_path)) dir.create(TetW_filt_path)
+TetW_filtFs <- file.path(TetW_filt_path, paste0(sampleNames, "_F_filt.fastq.gz"))
+TetW_filtRs <- file.path(TetW_filt_path, paste0(sampleNames, "_R_filt.fastq.gz"))
+library("ShortRead")
+library(Matrix)
+# to check no of files
+#length(TetW_fnFs) #384
+#length(TetW_fnRs) #384
+
+# to check for duplicates
+#any(duplicated(c(TetW_fnFs, TetW_fnRs)))
+#any(duplicated(c(TetW_filtFs, TetW_filtRs)))
+
+#head(TetW_fnFs)
+#head(TetW_fnRs)
+
+#head(TetW_filtFs)
+#head(TetW_filtRs)
+
+#can trim the reads according to what fits your dataset by changing the numbers in 'truncLen=c(240,160)'
+#additionally you can change your maxEE based off of what you are wanting (based off of expected errors)
+TetW_out <- filterAndTrim(TetW_fnFs, TetW_filtFs, TetW_fnRs, TetW_filtRs, truncLen=c(150,100), maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=TRUE, matchIDs = T)
+
+TetW_out
+TetW_fnFs
+TetW_fnRs
+
+saveRDS(TetW_out, "~/Desktop/grad_school/AMR_project/TetW_analysis/TetW_out.RDS")
+write.table(TetW_out, file="TetW_out.txt", col.names=T, row.names=T, sep = "\t",quote=F) #won't add quotations to headers
+#TetW_out <- readRDS("TetW_out.RDS")
+```
+
+# reads in and out after trimming
+```{r}
+sum(TetW_out[,1]) #total reads in---10 586 617
+sum(TetW_out[,2]) #total reads out---10 518 524
+sum(TetW_out[,1]) - sum(TetW_out[,2]) #reads lost---68 093
+sum(TetW_out[,2])/sum(TetW_out[,1]) # percentage data retained --- 0.993568
+```
+
+#learning error rates
+```{r}
+TetW_exists <- file.exists(TetW_filtFs) & file.exists(TetW_filtRs)
+TetW_filtFs <- TetW_filtFs[TetW_exists]
+TetW_filtRs <- TetW_filtRs[TetW_exists]
+```
+
+#dereplication
+```{r}
+derep_TetWFs <- derepFastq(TetW_filtFs, verbose=TRUE)
+derep_TetWRs <- derepFastq(TetW_filtRs, verbose=TRUE)
+head(derep_TetWFs)
+```
+
+#learning error rates
+```{r}
+names(derep_TetWFs) <- sampleNames
+names(derep_TetWRs) <- sampleNames
+sampleNames
+
+TetW_errF <- learnErrors(TetW_filtFs, multithread=TRUE) #error model for forward reads
+TetW_errR <- learnErrors(TetW_filtRs, multithread=TRUE) #error model for reverse reads
+
+plotErrors(TetW_errF)
+plotErrors(TetW_errR)
+
+save(TetW_exists, TetW_filtFs, TetW_filtRs, derep_TetWFs, derep_TetWRs, TetW_errF, TetW_errR, file = "error_plots_TetW.rds")
+#load("error_plots_TetW.rds")
+```
+
+#applying the learned error rates
+```{r}
+TetW_dadaFs <- dada(derep_TetWFs, err=TetW_errF, multithread=TRUE) #run the algorithm on forward fastq + apply error model
+TetW_dadaRs <- dada(derep_TetWRs, err=TetW_errR, multithread=TRUE)
+```
+
+#merging forward and reverse reads
+```{r}
+#mergePairs - take info from forward dada algorithm+ add to dereplicated fasta sequences then merge together
+merged_FR_TetW <- mergePairs(TetW_dadaFs, derep_TetWFs, TetW_dadaRs, derep_TetWRs, verbose=T) 
+head(merged_FR_TetW[[1]])
+saveRDS(merged_FR_TetW, file = "merged_FR_TetW.rds")
+#merged_FR_TetW <- readRDS("merged_FR_TetW.RDS")
+```
+
+#constructing an ASV table
+```{r}
+seqtable_TetW <- makeSequenceTable(merged_FR_TetW)
+dim(seqtable_TetW) #384, 167 (samples, ASVs)
+sample_names(otu_table(seqtable_TetW,taxa_are_rows = F))
+#distribution of sequence lengths
+table(nchar(getSequences(seqtable_TetW)))
+write.table(seqtable_TetW, file="seqtable_TetW.txt", col.names=T, row.names=T, sep = "\t",quote=F)
+
+#removing chimeras 
+seqtable_TetW_chremoved <- removeBimeraDenovo(seqtable_TetW)
+write.table(seqtable_TetW_chremoved, file="seqtab_TetW_chiremoved.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
+sample_names(otu_table(seqtable_TetW_chremoved, taxa_are_rows = F))
+saveRDS(seqtable_TetW_chremoved, file = "seqtab_TetW_chiremoved.RDS")
+#seqtable_TetW_chremoved <- readRDS("seqtab_TetW_chiremoved.rds")
+dim(seqtable_TetW_chremoved) #384 160 (samples, ASVs)
+
+#sum(seqtable_TetW_chremoved)/sum(seqtable_TetW) #0.9995219
+```
+
+#add track table 
+```{r}
+getN_TetW <- function(x) sum(getUniques(x))
+track_TetW <- cbind(TetW_out, sapply(TetW_dadaFs, getN_TetW), sapply(TetW_dadaRs, getN_TetW), sapply(merged_FR_TetW, getN_TetW), rowSums(seqtable_TetW_chremoved))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track_TetW) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track_TetW) <- sample.names
+head(track_TetW)
+```
+
+#making fasta files + otu tables
+```{r}
+# giving our seq headers more manageable names (ASV_1, ASV_2...)
+TetW_asv_seqs <- colnames(seqtable_TetW_chremoved)
+TetW_asv_headers <- vector(dim(seqtable_TetW_chremoved)[2], mode="character")
+
+for (i in 1:dim(seqtable_TetW_chremoved)[2]) {
+  TetW_asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs - ALL ASV SEQ
+TetW_asv_fasta <- c(rbind(TetW_asv_headers, TetW_asv_seqs))
+write.table(TetW_asv_fasta, "/Users/arenasee/Desktop/grad_school/AMR_project/TetW_analysis/ASVs_TetW.fa", row.names=FALSE,sep="\t", quote = FALSE)
+saveRDS(TetW_asv_fasta, "TetW_asv_fasta.RDS")
+#TetW_asv_fasta <- readRDS("TetW_asv_fasta.RDS")
+
+# count table:
+TetW_asv_tab <- t(seqtable_TetW_chremoved)
+row.names(TetW_asv_tab) <- sub(">", "", TetW_asv_headers)
+write.table(TetW_asv_tab, "/Users/arenasee/Desktop/grad_school/AMR_project/TetW_analysis/ASVs_counts_TetW.fa", sep="\t", quote=F)
+saveRDS(TetW_asv_tab, "TetW_asv_tab.RDS")
+#TetW_asv_tab <- readRDS("TetW_asv_tab.rds")
+```
+
+#putting mapping file in 
+```{r}
+library("readxl") #needs to be loaded explicitly outside of tidyverse
+library("tidyverse")
+
+amr_mappingfile <- "/Users/arenasee/Desktop/grad_school/AMR_project/excel_mapping_info/AMR_MAPPING_ORIENTATION.xlsx"
+tetW_map <- read_excel(amr_mappingfile, sheet = "TetW_map") #this specifies which sheet to read by name
+View(tetW_map)
+
+#this shows the classes of the variables 
+str(tetW_map)
+
+#checking for duplicates in index - can happen when negative controls and samples have same ID
+duplicated(tetW_map$Illumina_Index)
+
+#changing DayOfStudy from character -> factor 
+tetW_map$DayOfStudy <- as.factor(tetW_map$DayOfStudy)
+tetW_map$Treatment <- as.factor(tetW_map$Treatment)
+```
+
+#making phyloseq object
+```{r}
+#creating metadata 
+tetw_meta <- sample_data(tetW_map)
+View(tetw_meta)
+sample_names(tetw_meta) = tetw_meta$Illumina_Index
+
+#creating OTU table 
+tetw_otu_tab <- otu_table(TetW_asv_tab, taxa_are_rows =TRUE)
+#head(tetw_otu_tab)
+saveRDS(tetw_otu_tab, "tetw_otu_tab.RDS")
+
+#putting together phyloseq objects 
+tetw_phylobj <- phyloseq(tetw_otu_tab, tetw_meta)
+sample_names(otu_table(tetw_otu_tab))
+sample_names(sample_data(tetw_meta))
+View(sample_data(tetw_phylobj))
+
+#saving final object
+saveRDS(tetw_phylobj, file = "tetw_phylobj.rds")
+#tetw_phylobj <- readRDS("tetw_phylobj.rds")
+```
+
+#identifying contaminants 
+```{r}
+library(decontam); packageVersion("decontam")
+
+#this step identifies negatives and assigns T/F to them 
+sample_data(tetw_phylobj)$is.neg <- sample_data(tetw_phylobj)$Sample_Type == "NC"
+tetw_contamdf.prev <- isContaminant(tetw_phylobj, method="prevalence", neg="is.neg", batch = sample_data(tetw_phylobj)$Run, batch.combine = "minimum")
+#table(tetw_contamdf.prev$contaminant)
+#tetw_contamdf.prev$contaminant
+View(sample_data(tetw_phylobj))
+```
+
+#creating list of contaminants
+```{r}
+tetw_removal <- tetw_contamdf.prev[tetw_contamdf.prev$contaminant==FALSE,] #FALSE = non-contaminants, TRUE - contaminants
+tetw_removal_list <- row.names(tetw_removal)
+tetw_ps <- prune_taxa(taxa = tetw_removal_list, tetw_phylobj) 
+#(sum(taxa_sums(tetw_ps)))/(sum(taxa_sums(tetw_phylobj))) #0.9999367
+```
+
+#getting rid of NC samples
+```{r}
+# != means not equals, subset_samples = need to identify samples to keep
+tetw_ps_all <- subset_samples(tetw_ps, Sample_Type !="NC") 
+View(sample_data(tetw_ps_all))
+saveRDS(tetw_ps_all, file = "tetw_ps_all.RDS")
+#tetw_ps_all <- readRDS("tetw_ps_all.RDS")
+``` 
+
+#prevalence filtration 
+```{r}
+tetw_phylobj.prop <- transform_sample_counts(tetw_ps_all, function(x)x/sum(x))
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples - threshold at which we reocver 99% of the data and that we know is real bc it matches references
+flist <- filterfun(kOverA(2, 0.0015))
+
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+tetw_fedlogi <- filter_taxa(tetw_phylobj.prop, flist) #create a list of ASVs that meet flist criteria of 0.015% 
+#will give TRUE/FALSE based on if they meet criteria 
+
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+tetw_filt = prune_taxa(tetw_fedlogi, tetw_phylobj.prop)
+View(sample_data(tetw_filt))
+saveRDS(tetw_filt, "tetw_filt.RDS")
+#tetw_filt <- readRDS("tetw_filt.RDS")
+```
+
+#FASTA table of ASV sequences after all filtration steps was performed outside of R
+```{r}
+#fasta file of filtered ASVs was made in text editor manually 
+TetW.fa <- read.table("TetW_ASV_filt.fa")
+# ASV table was annotated against MegaRes database for TetW to ensure that all were TetW sequences
+```
+
+#subsetting different sample types as phyloseq objects for further analysis 
+#RUMEN samples
+```{r}
+#subsetting rumen samples
+tetw_ps_rumen <- subset_samples(tetw_filt, Sample_Type=="RUMEN")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(tetw_ps_rumen))
+
+saveRDS(tetw_ps_rumen, file = "tetw_ps_rumen.RDS")
+#tetw_ps_rumen <- readRDS("tetw_ps_rumen.RDS")
+```
+
+#FECAL samples
+```{r}
+#subsetting fecal samples
+tetw_ps_fecal <- subset_samples(tetw_filt, Sample_Type=="FECAL")
+
+#checking to see that the right samples have been subsetted
+View(sample_data(tetw_ps_fecal))
+
+saveRDS(tetw_ps_fecal, file = "tetw_ps_fecal.RDS")
+#tetw_ps_fecal <- readRDS("tetw_ps_fecal.RDS")
+```
+
+#SOIL samples
+```{r}
+#subsetting fecal samples
+tetw_ps_soil <- subset_samples(tetw_filt, Sample_Type=="SOIL/RUNOFF")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(tetw_ps_soil))
+
+saveRDS(tetw_ps_soil, file = "tetw_ps_soil.RDS")
+#tetw_ps_soil <- readRDS("tetw_ps_soil.RDS")
+```
+
+#FSM samples
+```{r}
+#subsetting fecal samples
+tetw_ps_fsm <- subset_samples(tetw_filt, Sample_Type=="FSM")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(tetw_ps_soil))
+
+saveRDS(tetw_ps_fsm, file = "tetw_ps_fsm.RDS")
+#tetw_ps_fsm <- readRDS("tetw_ps_fsm.RDS")
+```
+
+################################### ANALYSIS BY SAMPLE TYPE ######################################
+## RUMEN
+# PCOA + PERMANOVA
+```{r}
+#transform data to proportions
+tetw_rumen.prop <- transform_sample_counts(tetw_ps_rumen, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+tetw_rumen_dist <- phyloseq::distance(tetw_rumen.prop, method="bray")
+
+#making a data frame of sample_data
+tetw_rumen_df <- data.frame(sample_data(tetw_ps_rumen))
+
+#performing permanova
+tetw_rumen_perm <- adonis(t(tetw_rumen_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, data = tetw_rumen_df, permutations = 999)
+
+#making table/figure out of the permanova results
+tetw_rumen_permtab <- tetw_rumen_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between rumen microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title = "tetw Rumen Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_rumen_permtab.pdf")
+
+#pairwise comparisons between treatments
+tetw_rumen_pairadonis <- pairwise.adonis(tetw_rumen_dist, tetw_rumen_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) 
+
+#making table/figure out of the permanova results
+tetw_rumen_pctab <- tetw_rumen_pairadonis %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of rumen microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments. Significance is determined at p < 0.05.",threeparttable = T, general_title = "tetw Rumen Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_rumen_pctab.pdf")
+```
+
+#RUMEN - beta diversity 
+```{r}
+#perform ordinations
+tetw_rumen.bray <- ordinate(tetw_rumen.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+tetw_rumen_bctreat <- plot_ordination(tetw_rumen.prop, tetw_rumen.bray, color="Treatment") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+tetw_rumen.bctime <- plot_ordination(tetw_rumen.prop, tetw_rumen.bray, color="DayOfStudy") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+
+tetw_rumen_pcoa <- plot_grid(tetw_rumen_bctreat, tetw_rumen.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/tetw_Rumen_Beta.pdf", width=20, height = 20, units = "cm")
+
+saveRDS(tetw_rumen.bray, "tetw_rumen.bray.RDS")
+```
+
+#RUMEN - alpha diversity
+```{r}
+#perform alpha diversity on non-filtered data
+tetw_rum_raw <- subset_samples(tetw_phylobj, Sample_Type=="RUMEN")
+saveRDS(tetw_rum_raw,"tetw_rum_raw.RDS")
+
+tetw_rum_alpha <- estimate_richness(tetw_rum_raw, measures=c("Shannon", "Observed")) 
+tetw_rum_alpha <- merge(as(sample_data(tetw_rum_raw),"matrix"), tetw_rum_alpha, by=0)
+rownames(tetw_rum_alpha) <- tetw_rum_alpha$Row.names
+
+tetw_rum_obsalpha <- ggplot(data = tetw_rum_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+tetw_rum_shanalpha <- ggplot(data = tetw_rum_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+tetw_rum_alphaplot <- plot_grid(tetw_rum_obsalpha, tetw_rum_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Rumen_alpha.pdf", width=20, height = 20, units = "cm")
+
+saveRDS(tetw_rum_alpha, "tetw_rum_alpha.RDS")
+```
+
+#RUMEN - deseq heatmap only 1 diff ASV detected
+```{r}
+#phyloseq object that is not normalised!
+tetw_ps_rumen 
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+tetw_rum_dds = phyloseq_to_deseq2(tetw_ps_rumen, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(tetw_rum_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+tetw_rum_dds = estimateSizeFactors(tetw_rum_dds, geoMeans=geoMeans) 
+tetw_rum_dds = DESeq2::DESeq(tetw_rum_dds, test = "Wald", fitType = "local") 
+
+tetw_rumres=DESeq2::results(tetw_rum_dds)
+DESeq2::resultsNames(tetw_rum_dds)
+tetw_rumres=tetw_rumres[order(tetw_rumres$padj, na.last=NA),]
+alpha = 0.05
+
+tetw_rum.st = tetw_rumres[(tetw_rumres$padj < alpha),]
+data.frame(tetw_rum.st)
+write.table(tetw_rum.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/tetw_analysis/tetw_rum_st.tsv", sep = "\t")
+```
+
+#################################FECAL########################################
+```{r}
+#proportional data 
+tetw_fecal.prop <- transform_sample_counts(tetw_ps_fecal, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+tetw_fecal_dist <- phyloseq::distance(tetw_fecal.prop, method="bray")
+
+#making a data frame of sample_data
+tetw_fecal_df <- data.frame(sample_data(tetw_ps_fecal))
+
+tetw_fecal_perm<- adonis(t(tetw_fecal_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy,data = tetw_fecal_df, permutations = 999)
+
+#making table/figure out of the permanova results
+tetw_fecal_permtab <- tetw_fecal_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between fecal microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="tetw Fecal Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_fecal_permtab.pdf")
+
+#pairwise comparisons between treatments
+tetw_fec_pairadonis <- pairwise.adonis(tetw_fecal_dist, tetw_fecal_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+tetw_fec_pctab <- tetw_fec_pairadonis %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of fecal microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments. Significance is determined at p < 0.05.",threeparttable = T, general_title = "TetW Fecal Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_fec_pctab.pdf")
+```
+
+#beta diversity per sample type - FECAL
+```{r}
+#perform ordinations on proportional data w/ bray-curtis
+tetw_fecal.ord <- ordinate(tetw_fecal.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+tetw_fecal.bctreat <- plot_ordination(tetw_fecal.prop, tetw_fecal.ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+tetw_fecal.bctime <- plot_ordination(tetw_fecal.prop, tetw_fecal.ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+tetw_fecal_pcoa <- plot_grid(tetw_fecal.bctreat, tetw_fecal.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Fecal_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#FECAL - alpha diversity 
+```{r}
+#perform alpha diversity on non-filtered data
+tetw_fec_raw <- subset_samples(tetw_phylobj, Sample_Type=="FECAL")
+saveRDS(tetw_fec_raw, "tetw_fec_raw.RDS")
+
+tetw_fec_alpha <- estimate_richness(tetw_fec_raw, measures=c("Shannon", "Observed"))
+tetw_fec_alpha <- merge(as(sample_data(tetw_fec_raw),"matrix") , tetw_fec_alpha, by=0)
+rownames(tetw_fec_alpha) <- tetw_fec_alpha$Row.names
+
+tetw_fec_obsalpha <- ggplot(data = tetw_fec_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+tetw_fec_shanalpha <- ggplot(data = tetw_fec_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+tetw_fec_alphaplot <- plot_grid(tetw_fec_obsalpha, tetw_fec_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Fecal_Alpha.pdf", width=20, height = 20, units = "cm")
+```
+
+#FECAL - DESEQ heatmap only 1 diff ASV identified
+```{r}
+#phyloseq object that is not normalised!
+tetw_fec_ds <- subset_samples(tetw_ps_all, Sample_Type == "FECAL")
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+tetw_fec_dds = phyloseq_to_deseq2(tetw_fec_ds, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(tetw_fec_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+tetw_fec_dds = estimateSizeFactors(tetw_fec_dds, geoMeans=geoMeans) 
+tetw_fec_dds = DESeq2::DESeq(tetw_fec_dds, test = "Wald", fitType = "local") 
+
+tetw_fecres=DESeq2::results(tetw_fec_dds)
+DESeq2::resultsNames(tetw_fec_dds)
+tetw_fecres=tetw_fecres[order(tetw_fecres$padj, na.last=NA),]
+alpha = 0.05
+
+tetw_fec.st = tetw_fecres[(tetw_fecres$padj < alpha),]
+write.table(tetw_fec.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/tetw_analysis/tetw_fec_st.tsv", sep = "\t")
+```
+
+########################################## SOIL/LRO ########################################
+#beta diversity
+```{r}
+tetw_soil.prop <- transform_sample_counts(tetw_ps_soil, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+tetw_soil_ord <- ordinate(tetw_soil.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+tetws_treat <- plot_ordination(tetw_soil.prop, tetw_soil_ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+tetws_time <- plot_ordination(tetw_soil.prop, tetw_soil_ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+tetws_pcoa <- plot_grid(tetws_treat, tetws_time, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Soil_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+tetw_soil_dist <- phyloseq::distance(tetw_soil.prop, method="bray")
+
+#making a data frame of sample_data
+tetw_soil_df <- data.frame(sample_data(tetw_ps_soil))
+
+tetw_soil_perm<- adonis(t(tetw_soil_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy,data = tetw_soil_df, permutations = 999)
+
+#making table/figure out of the permanova results
+tetw_soil_permtab <- tetw_soil_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between soil/runoff microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="TetW Soil Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_soil_permtab.pdf")
+
+#pairwise comparisons between treatments
+tetw_soil.pc <- pairwise.adonis(tetw_soil_dist, tetw_soil_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+tetw_soil.pctab <- tetw_soil.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of soil/runoff microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments. Significance is determined at p < 0.05.",threeparttable = T, general_title = "TetW Soil Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_soil_pctab.pdf")
+```
+
+# alpha diversity 
+```{r}
+#subset unnormalized ps object
+tet_soil.uf <- subset_samples(tetw_ps_all, Sample_Type=="SOIL/RUNOFF")
+tet_soil_base <- subset_samples(tet_soil.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+tet_sba <- estimate_richness(tet_soil_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+tet_sba<- merge(as(sample_data(tet_soil_base),"matrix") , tet_sba, by=0)
+rownames(tet_sba) <- tet_sba$Row.names
+
+tetsoilbase_obs <- ggplot(data = tet_sba, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+tetsoilbase_shan <- ggplot(data = tet_sba, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+
+#alpha diversity only at days 172, 196, 226
+tet_soil.tg <- subset_samples(tet_soil.uf, DayOfStudy!="Day_0")
+
+tet_soil_alp <- estimate_richness(tet_soil.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+tet_soil_alp<- merge(as(sample_data(tet_soil.tg),"matrix") , tet_soil_alp, by=0)
+rownames(tet_soil_alp) <- tet_soil_alp$Row.names
+
+tets_tg_obsalp <- ggplot(data = tet_soil_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+tets_tg_shanalp <- ggplot(data = tet_soil_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+tetsoil_obs <- plot_grid(tetsoilbase_obs,tets_tg_obsalp, ncol=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/SOIL_ALL_CombAlpha.pdf", width=35, height = 30, units = "cm")
+```
+
+############################################## FSM #############################################
+#beta
+```{r}
+tetw_fsm.prop <- transform_sample_counts(tetw_ps_fsm, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+tetw_fsm_ord <- ordinate(tetw_fsm.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+tetw_fsm_treat <- plot_ordination(tetw_fsm.prop, tetw_fsm_ord, color="Treatment") + theme_half_open()  + geom_point(size=3) + stat_ellipse()
+tetw_fsm_time <- plot_ordination(tetw_fsm.prop, tetw_fsm_ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) + stat_ellipse()
+
+fsm_pcoa <- plot_grid(tetw_fsm_treat, tetw_fsm_time, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/FSM_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+tetw_fsm_dist <- phyloseq::distance(tetw_fsm.prop, method="bray")
+
+#making a data frame of sample_data
+tetw_fsm_df <- data.frame(sample_data(tetw_ps_fsm))
+
+tetw_fsm_perm <- adonis(t(tetw_fsm_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy,data = tetw_fsm_df, permutations = 999)
+
+#making table/figure out of the permanova results
+tetw_fsm_permtab <- tetw_fsm_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between FSM microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="TetW FSM Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_fsm_permtab.pdf")
+
+#pairwise comparisons between treatments
+tetw_fsm.pc <- pairwise.adonis(tetw_fsm_dist, tetw_fsm_df$DayOfStudy, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+tetw_fsm.pctab <- tetw_fsm.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between timepoints of FSM microbiome samples (999 permutations). The statistical model performs a pairwise comparison between timepoints Significance is determined at p < 0.05.",threeparttable = T, general_title = "TetW FSM Timepoints - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_fsm_pctab.pdf")
+```
+
+#alpha diversity
+```{r}
+tet_fsm.uf <- subset_samples(tetw_ps_all, Sample_Type=="FSM")
+tet_fsm_base <- subset_samples(tet_fsm.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+tet_base_a <- estimate_richness(tet_fsm_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+tet_base_a<- merge(as(sample_data(tet_fsm_base),"matrix") , tet_base_a, by=0)
+rownames(tet_base_a) <- tet_base_a$Row.names
+
+tetbase_obsalp <- ggplot(data = tet_base_a, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+tetbase_shanalp <- ggplot(data = tet_base_a, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+tetbase_comb <- plot_grid(tetbase_obsalp, tetbase_shanalp, labels="AUTO", nrow = 2)
+
+#alpha diversity only at days 141, 151
+tet_fsm.tg <- subset_samples(tet_fsm.uf, DayOfStudy!="Day_0")
+
+tet_fsm_alp <- estimate_richness(tet_fsm.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+tet_fsm_alp<- merge(as(sample_data(tet_fsm.tg),"matrix") , tet_fsm_alp, by=0)
+rownames(tet_fsm_alp) <- tet_fsm_alp$Row.names
+
+tetfsm_tg_obsalp <- ggplot(data = tet_fsm_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+tetfsm_tg_shanalp <- ggplot(data = tet_fsm_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+tetfsm_all <- plot_grid(tetbase_obsalp,tetbase_shanalp,tetfsm_tg_obsalp, tetfsm_tg_shanalp, labels="AUTO", nrow = 2, ncol=2)
+
+tetfsm_obs <- plot_grid(tetbase_obsalp,tetfsm_tg_obsalp, ncol=2)
+tetfsm_shan <- plot_grid(tetbase_shanalp,tetfsm_tg_shanalp, ncol=2)
+
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/FSM_ALL_CombAlpha.pdf", width=30, height = 25, units = "cm")
+```
+
+
+```{r}
+tetw_fsm_uf <- subset_samples(tetw_ps_all, Sample_Type=="FSM")
+
+tet_fsm_dds = phyloseq_to_deseq2(tetw_fsm_uf, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(tet_fsm_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+tet_fsm_dds = estimateSizeFactors(tet_fsm_dds, geoMeans=geoMeans) 
+tet_fsm_dds = DESeq2::DESeq(tet_fsm_dds, test = "Wald", fitType = "local") 
+
+tetw_fsmres=DESeq2::results(tet_fsm_dds)
+DESeq2::resultsNames(tet_fsm_dds)
+tetw_fsmres=tetw_fsmres[order(tetw_fsmres$padj, na.last=NA),]
+alpha = 0.05
+
+tetw_fsm.st = tetw_fsmres[(tetw_fsmres$padj < alpha),]
+View(tetw_fec.st)
+write.table(tetw_fec.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/tetw_analysis/tetw_fec_st.tsv", sep = "\t")
+
+#finding top 10 sig diff ASVs
+tetw_fec.top20 <- head(tetw_fec.st, 20)
+
+tetw_fec.df <- as.data.frame(colData(tetw_fec_dds)[c("Treatment", "DayOfStudy")])
+tetw_fec.vsd <- varianceStabilizingTransformation(tetw_fec_dds)
+
+#extract names of differentially abundant ASVs
+names20 <- as.factor(rownames(tetw_fec.top20))
+
+#make a subset of the log transformed counts for the differentially abundant genes
+tetw_fec.top<-assay(tetw_fec.vsd)
+top20fdiff<- tetw_fec.top[rownames(tetw_fec.top) %in% names20, ] 
+
+colnames(tetw_fec.df) <- c("Treatment", "DayOfStudy")
+
+tetw_fec_diffASV <- pheatmap(top20fdiff, scale = "row",
+                                  annotation_col = tetw_fec.df, 
+                                  cluster_rows = T, 
+                                  cluster_cols = F, 
+                                  fontsize_col = 5.5,
+                                  width = 13,
+                                  height = 6,
+                                  fontface_row = "italic",
+                     filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/tetw_fec_diffASV.pdf")
+
+```
+
+### ANALYSIS OF ALL SAMPLES
+# heatmap to look at ASV abundance
+```{r}
+pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/ASV_abund_HM.pdf")
+p <- plot_heatmap(tetw_filt)
+p <- p + theme(legend.position = "right", legend.direction="vertical") 
+dev.off()
+```
+
+#PHEATMAP 
+```{r}
+# set sample order
+#sample_data(tetw_filt)$DayOfStudy <- factor(sample_data(tetw_filt)$DayOfStudy, levels = c("Day_0", "Day_42", "Day_141","Day_154","Day_172","Day_"))
+tetw.s <- set_sample_order(tetw_filt, sort_on=c("Sample_Type", "DayOfStudy"))
+
+transf_asv <- transform_sample_counts(tetw.s, function(x)x/sum(x))
+
+#turn asv table into matrix
+m <- as.matrix(otu_table(transf_asv))
+
+tetw_df <- data.frame(sample_data(transf_asv))
+
+#remove all cols except sample type/day of study
+tetw_df <- tetw_df[, c(4,6)]
+
+colnames(tetw_df) <- c("Sample_Type", "DayOfStudy")
+
+tetw_df$DayOfStudy <- factor(tetw_df$DayOfStudy, levels = c("Day_0", "Day_42", "Day_141", "Day_154", "Day_172", "Day_196", "Day_226"))
+
+tetw_pheat <- pheatmap(m, scale = "row",
+                            annotation_col = tetw_df,
+                            gaps_col = c(134, 190, 334),
+                           cluster_rows = T, 
+                            cluster_cols = F, 
+                            show_rownames=T,
+                           cutree_rows = 4,
+                            fontsize_col = 7,
+                       cellwidth = 6,
+                           cellheight = 10,
+                          clustering_distance_rows = "euclidean",
+                         fontface_row = "italic",                       
+                       filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/heatmap.pdf")
+```
+
+
+
+
+#heatmap by sample type
+```{r}
+plot_heatmap(tetw_ps_rumen, sample.label="DayOfStudy", sample.order="DayOfStudy")
+```
+
+# bray curtis
+```{r}
+#transform data to proportions
+tetw_all.prop <- transform_sample_counts(tetw_filt, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+ord <- ordinate(tetw_all.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+tetw_treat <- plot_ordination(tetw_all.prop, ord, color="Treatment") + theme_half_open()  + geom_point(size=3)
+tetw_sample <- plot_ordination(tetw_all.prop, ord, color="Sample_Type") + theme_half_open()  + geom_point(size=3) 
+
+tetw_all_pcoa <- plot_grid(tetw_treat, tetw_sample, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/AllSamples_Beta.pdf", width=25, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+tetw_dist <- phyloseq::distance(tetw_all.prop, method="bray")
+
+#making a data frame of sample_data
+tetw.df <- data.frame(sample_data(tetw_filt))
+
+perm <- adonis(t(tetw_dist) ~Treatment + Sample_Type + Treatment*Sample_Type,data = tetw.df, permutations = 999)
+
+#making table/figure out of the permanova results
+tetw_permtab <- perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between all microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="TetW All Samples Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/tetw_all_permtab.pdf")
+
+#pairwise comparisons between treatments
+tetw_treat.pc <- pairwise.adonis(tetw_dist, tetw.df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+```
+
+#alpha diversity
+```{r}
+# putting all plots together
+observed <- plot_grid(tetw_rum_obsalpha, tetw_fec_obsalpha, tetsoil_obs, tetfsm_obs, labels="AUTO", nrow=4)
+shannon <- plot_grid(tetw_rum_obsalpha, tetw_fec_obsalpha, tetsoil_obs, tetfsm_obs, labels="AUTO", nrow=4)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Tetw_Alpha.pdf", width=20, height = 20, units = "cm")
+```
+
+#DESEQ heatmap -- comparison between treatments
+```{r}
+#phyloseq object that is not normalised!
+tetw_ps_all
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+tw_dds_tr = phyloseq_to_deseq2(tetw_ps_all, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(tw_dds_tr), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+tw_dds_tr = estimateSizeFactors(tw_dds_tr,geoMeans=geoMeans) 
+tw_dds_tr = DESeq2::DESeq(tw_dds_tr, test = "Wald", fitType = "local") 
+
+tw_res=DESeq2::results(tw_dds_tr)
+DESeq2::resultsNames(tw_dds_tr)
+tw_res=tw_res[order(tw_res$padj, na.last=NA),]
+alpha = 0.05
+
+tetw_treat.st = tw_res[(tw_res$padj < alpha),]
+View(tetw_treat.st)
+write.table(tetw_treat.st, file = "DESEQ_treat_sigtab.tsv", sep = "\t")
+
+tetw_tr_df <- as.data.frame(colData(tw_dds_tr)[c("Treatment", "Sample_Type")])
+tetw_tr.vsd <- varianceStabilizingTransformation(tw_dds_tr)
+tetw_tr.prop <- as(otu_table(transform_sample_counts(tetw_ps_all, function(x) x/sum(x))), "matrix")
+View(tetw_tr.prop)
+
+#finding top 10 sig diff ASVs
+tetw_top20.tr <- head(tetw_treat.st, 20)
+```
+
+#DESEQ comparison between sample types
+```{r}
+#phyloseq object that is not normalised!
+tetw_ps_all 
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+tetw_dds_st = phyloseq_to_deseq2(tetw_ps_all, ~Sample_Type) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(tetw_dds_st), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+tetw_dds_st = estimateSizeFactors(tetw_dds_st, geoMeans=geoMeans) 
+tetw_dds_st = DESeq2::DESeq(tetw_dds_st, test = "Wald", fitType = "local") 
+
+tw_res=DESeq2::results(tetw_dds_st)
+DESeq2::resultsNames(tetw_dds_st)
+tw_res=tw_res[order(tw_res$padj, na.last=NA),]
+alpha = 0.05
+
+tetw_samp.st = tw_res[(tw_res$padj < alpha),]
+View(tetw_samp.st)
+write.table(tetw_samp.st, file = "DESEQ_sampletype_sigtab.tsv", sep = "\t")
+```
+
+################################## MERGING ASV TABLES FOR NET ANALYSIS ################################
+```{r}
+#original phyloseq objects had illumina indexes as rownames - had to be reordered according to tube no (which must match exactly) 
+R16s_ps_reord <- set_sample_order(R16s_inj_phylobj, "Tube")
+tetw_rum_reord <- set_sample_order(tetw_ps_rumen, "Tube")
+
+## merging ASV tables
+merged_otu <- merge_phyloseq_pair(otu_table(tetw_rum_reord), otu_table(R16s_ps_reord))
+write.table(merged_otu, file="merged_otu.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
+```   
+
+#fecal
+```{r}
+#F16s_inj_phylobj <- readRDS("F16s_inj_phylobj.RDS")
+
+#adding "T_" to TetW ASVs so they can be differentiated from 16s ASVs
+taxa_names(tetw_ps_fecal) <- paste("T_", taxa_names(tetw_ps_fecal), sep="")
+taxa_names(tetw_ps_fecal)
+
+#setting sample # according to tube no
+F16s_ps_reord <- set_sample_order(F16s_inj_phylobj, "Tube")
+tetw_fec_reord <- set_sample_order(tetw_ps_fecal, "Tube")
+
+## merging ASV tables
+F16s_tet.asv <- merge_phyloseq_pair(otu_table(F16s_ps_reord), otu_table(tetw_fec_reord))
+write.table(F16s_tet.asv, file="F16s_tet.asv.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
+```
+
