@@ -1,9 +1,5 @@
----
-title: "sul1_analysis"
-author: "Arena See"
-date: '2022-03-28'
-output: html_document
----
+######################################################## SUL1 ANALYSIS ########################################################
+
 ```{r}
 library("BiocManager")
 library("import")
@@ -152,114 +148,10 @@ plot_deseq = function(dsdf, alpha = 0.1){
 }
 ```
 
-#setting ordination plot theme
-```{r}
-add_theme = function(p, pt.sz = 3){
-  require("ggplot2")
-  # guides(fill=FALSE)
-  # Add consistent layers/themes
-  p + 
-    geom_point(mapping = aes(shape = DIAGNOSIS, 
-                             color = DIAGNOSIS),
-               size = pt.sz, alpha = 1) + 
-    geom_path(aes(group = HOST_SUBJECT_ID), 
-              color = "black", 
-              size = 0.25) +
-    scale_colour_manual(values = tumorPalette) +
-    theme(text = element_text(size = legTextSize),
-          legend.position="none")
-}
-```
-
-#function to convert phyloseq object to ampvis2 object
-```{r}
-phyloseq_to_ampvis2 <- function(physeq) {
-  #check object for class
-  if(!any(class(physeq) %in% "phyloseq"))
-    stop("physeq object must be of class \"phyloseq\"", call. = FALSE)
-  
-  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
-  if(is.null(physeq@tax_table))
-    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = FALSE)
-  
-  #OTUs must be in rows, not columns
-  if(phyloseq::taxa_are_rows(physeq))
-    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
-  else
-    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
-  
-  #tax_table is assumed to have OTUs in rows too
-  tax <- phyloseq::tax_table(physeq)@.Data
-  
-  #merge by rownames (OTUs)
-  otutable <- merge(
-    abund,
-    tax,
-    by = 0,
-    all.x = TRUE,
-    all.y = FALSE,
-    sort = FALSE
-  )
-  colnames(otutable)[1] <- "OTU"
-  
-  #extract sample_data (metadata)
-  if(!is.null(physeq@sam_data)) {
-    metadata <- data.frame(
-      phyloseq::sample_data(physeq),
-      row.names = phyloseq::sample_names(physeq), 
-      stringsAsFactors = FALSE, 
-      check.names = FALSE
-    )
-    
-    #check if any columns match exactly with rownames
-    #if none matched assume row names are sample identifiers
-    samplesCol <- unlist(lapply(metadata, function(x) {
-      identical(x, rownames(metadata))}))
-    
-    if(any(samplesCol)) {
-      #error if a column matched and it's not the first
-      if(!samplesCol[[1]])
-        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = FALSE)
-    } else {
-      #assume rownames are sample identifiers, merge at the end with name "SampleID"
-      if(any(colnames(metadata) %in% "SampleID"))
-        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = FALSE)
-      metadata$SampleID <- rownames(metadata)
-      
-      #reorder columns so SampleID is the first
-      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = FALSE]
-    }
-  } else
-    metadata <- NULL
-  
-  #extract phylogenetic tree, assumed to be of class "phylo"
-  if(!is.null(physeq@phy_tree)) {
-    tree <- phyloseq::phy_tree(physeq)
-  } else
-    tree <- NULL
-  
-  #extract OTU DNA sequences, assumed to be of class "XStringSet"
-  if(!is.null(physeq@refseq)) {
-    #convert XStringSet to DNAbin using a temporary file (easiest)
-    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
-    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
-  } else
-    fastaTempFile <- NULL
-  
-  #load as normally with amp_load
-  ampvis2::amp_load(
-    otutable = otutable,
-    metadata = metadata,
-    tree = tree,
-    fasta = fastaTempFile
-  )
-}
-```
-
 ########################################### DADA2 & PHYLOSEQ PIPELINE ####################################
 #reading in fastq files
 ```{r}
-sul1_fastq_files <- "/Volumes/Arena/AMR/sul1_3_25_22/sul1_aes-345539723/sul1_fastq_files" #where  fastq files are
+sul1_fastq_files <- "/filepath/sul1_fastq_files" #where  fastq files are
 list.files(sul1_fastq_files) #listing fastq files
 saveRDS(sul1_fastq_files, "sul1_fastq_files.RDS")
 sul1_fastq_files <- readRDS("sul1_fastq_files.RDS")
@@ -322,7 +214,7 @@ sul1_fnRs
 ```
 
 ```{r}
-saveRDS(sul1_out, "~/Desktop/grad_school/AMR_project/sul1_analysis/sul1_out.RDS")
+saveRDS(sul1_out, "~/filepath/sul1_out.RDS")
 write.table(sul1_out, file="sul1_out.RDS", col.names=T, row.names=T, sep = "\t",quote=F) #won't add quotations to headers
 #sul1_out <- readRDS("~/Desktop/grad_school/AMR_project/sul1_analysis/sul1_out.RDS")
 ```
@@ -421,23 +313,23 @@ for (i in 1:dim(seqtable_sul1_chremoved)[2]) {
 
 # making and writing out a fasta of our final ASV seqs:
 sul1_asv_fasta <- c(rbind(sul1_asv_headers, sul1_asv_seqs))
-write.table(sul1_asv_fasta, "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/ASVs_sul1.fa", row.names=FALSE,sep="\t", quote = FALSE)
+write.table(sul1_asv_fasta, "/filepath/ASVs_sul1.fa", row.names=FALSE,sep="\t", quote = FALSE)
 saveRDS(sul1_asv_fasta, "sul1_asv_fasta.RDS")
 
 # count table:
 sul1_asv_tab <- t(seqtable_sul1_chremoved)
 row.names(sul1_asv_tab) <- sub(">", "", sul1_asv_headers)
-write.table(sul1_asv_tab, "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/ASVs_counts_sul1.fa", sep="\t", quote=F)
+write.table(sul1_asv_tab, "/filepath/ASVs_counts_sul1.fa", sep="\t", quote=F)
 saveRDS(sul1_asv_tab, "sul1_asv_tab.RDS")
 #sul1_asv_tab <- readRDS("sul1_asv_tab.RDS")
 ```
 
 #putting mapping file in 
 ```{r}
-library("readxl") #needs to be loaded explicitly outside of tidyverse
+library("readxl")
 library("tidyverse")
 
-amr_mappingfile <- "/Users/arenasee/Desktop/grad_school/AMR_project/excel_mapping_info/AMR_MAPPING_ORIENTATION.xlsx"
+amr_mappingfile <- "/filepath/AMR_MAPPING_ORIENTATION.xlsx"
 sul1_mappingfile <- read_excel(amr_mappingfile, sheet = "sul1_map") #this specifies which sheet to read by name
 View(sul1_mappingfile)
 
@@ -811,7 +703,7 @@ sul1soil_all <- plot_grid(sul1soilbase_obs,sul1soilbase_shan,sul1s_tg_obsalp, su
 ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/SOIL_ALL_CombAlpha.pdf", width=35, height = 30, units = "cm")
 ```
 
-######################################### FSM #####################################
+##################################################### FSM ############################################
 #BETA
 ```{r}
 sul1_fsm.prop <- transform_sample_counts(sul1_ps_fsm, function(x)x/sum(x))
@@ -892,7 +784,7 @@ sul1fsm_all <- plot_grid(sul1base_obsalp,sul1base_shanalp,sul1fsm_tg_obsalp, sul
 ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/FSM_ALL_CombAlpha.pdf", width=30, height = 25, units = "cm")
 ```
 
-######## all analysis
+######################################################## all sample analysis
 #heatmap of asv abundance
 ```{r}
 pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/ASV_abund_HM.pdf")
