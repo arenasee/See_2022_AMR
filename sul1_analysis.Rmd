@@ -1,0 +1,987 @@
+---
+title: "sul1_analysis"
+author: "Arena See"
+date: '2022-03-28'
+output: html_document
+---
+```{r}
+library("BiocManager")
+library("import")
+library("knitr")
+library("BiocStyle")
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+library("phyloseq")
+library("DECIPHER")
+library("ape")
+library("phangorn")
+library("ShortRead")
+library("pairwiseAdonis")
+library("vegan")
+library("cowplot")
+library("kableExtra")
+library("plyr"); packageVersion("plyr")
+library("data.table"); packageVersion("data.table")
+library( "DESeq2" )
+library("ggrepel")
+library("ggpubr")
+set.seed(711L)
+```
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library("knitr")
+library("BiocStyle")
+.cran_packages <- c("ggplot2", "gridExtra")
+.bioc_packages <- c("dada2", "phyloseq", "DECIPHER", "phangorn")
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+   source("http://bioconductor.org/biocLite.R")
+   biocLite(.bioc_packages[!.inst], ask = F)
+}
+# Load packages into session, and print package version
+sapply(c(.cran_packages, .bioc_packages), require, character.only = TRUE)
+```
+
+############################### SETTING COLOR PALETTE FOR PLOTS ######################
+```{r}
+plotTextSize = 9
+legTextSize = 7
+theme_set(theme_bw() + 
+            theme(text = element_text(size = plotTextSize),
+                  legend.text = element_text(size = legTextSize),
+                  legend.position = "top",
+                  legend.direction = "horizontal",
+                  legend.margin = margin(t = 0, b = -0.75, unit='line'),
+                  axis.title.x = element_text(margin=margin(0.3, 0, 0, 0, unit = "lines")),
+                  axis.title.y = element_text(margin=margin(0, 0.3, 0, 0, unit = "lines")),
+                  panel.spacing = margin(t = 0, unit='line'),
+                  plot.margin = unit(x = c(0.25, 0.2, 0.5, 0.1),
+                                     units="line")
+            )
+)
+tumorPalette = c(Healthy = "chartreuse4",
+                 Tumor = "lightgray")
+
+library(wesanderson)
+pal <- wes_palette("Zissou1", 100, type = "continuous")
+pal2 <- wes_palette("Cavalcanti1",100,type="continuous")
+pal3 <- c(wes_palette("Royal1", type = "discrete"),
+          wes_palette("Chevalier1", type = "discrete"),
+          wes_palette("FantasticFox1",type = "discrete"),
+          wes_palette("IsleofDogs1", type = "discrete"),
+          wes_palette("BottleRocket1", type = "discrete"),
+          wes_palette("Rushmore1", type = "discrete"),
+          wes_palette("Darjeeling1", type = "discrete"),
+          wes_palette("Moonrise1", type = "discrete"),
+          wes_palette("GrandBudapest1", type = "discrete"),
+          wes_palette("Cavalcanti1", type = "discrete"))
+```
+
+###################### FUNCTIONS USED IN ANALYSIS ################################
+```{r}
+#setting custom geometric mean function with zero/NA tolerance
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+#phyloseq_clr code
+library(compositions)
+zero_comp = function(x){
+  if(taxa_are_rows(x)){x <- t(x)}
+  matx = otu_table(x)
+  # `zCompositions::cmultRepl` expects the samples to be in rows and OTUs to be in columns 
+  matxzc = zCompositions::cmultRepl(matx, method="CZM", output="counts")
+  otu_table(x) <- otu_table(matxzc, taxa_are_rows = FALSE)
+  return(x)
+}
+
+# CLR definition
+geometric_mean = function(x){
+  exp(mean(log(x)))
+}
+clr = function(x, base=2){
+  x <- log((x / geometric_mean(x)), base)
+}
+phyloseq_CLR = function(physeq){
+  suppressMessages({physeq <- zero_comp(physeq)})
+  return(transform_sample_counts(physeq, fun = clr))
+}
+```
+
+#function for plot table of significant values
+```{r}
+plot_deseq = function(dsdf, alpha = 0.1){
+  # Phylum order
+  x = tapply(dsdf$log2FoldChange, dsdf$Phylum, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Phylum <- factor(as.character(dsdf$Phylum), levels=names(x))
+  # Genus order
+  x = tapply(dsdf$log2FoldChange, dsdf$Genus, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Genus <- factor(as.character(dsdf$Genus), levels=names(x))
+  # Define the special points worth highlighting
+  specialdf = dsdf[(dsdf$pvalue < alpha), ]
+  specialdf$OTU <- row.names(specialdf)
+  # Now define the ggplot2 object.
+  p = ggplot(
+    data = dsdf, 
+    mapping = aes(x = log2FoldChange,
+                  y = -log10(pvalue),
+                  size = -log10(pvalue))
+    ) + 
+    geom_vline(xintercept = 0.0, linetype = 2) +
+      # the background of all results
+    geom_point(color = "black", alpha = 0.65) + 
+      # the few interesting, borderline significant results
+    geom_point(data = specialdf,
+               mapping = aes(color = Family)) +
+    geom_text_repel(data = specialdf,
+                    mapping = aes(label = paste(OTU, Genus))) +
+    scale_size_continuous(range = c(1, 4)) +
+    guides(size=FALSE) +
+    # axis labels
+    labs(y = expression(-log[10](p)),
+         x = expression(log[2](FC)))
+  return(p)
+}
+```
+
+#setting ordination plot theme
+```{r}
+add_theme = function(p, pt.sz = 3){
+  require("ggplot2")
+  # guides(fill=FALSE)
+  # Add consistent layers/themes
+  p + 
+    geom_point(mapping = aes(shape = DIAGNOSIS, 
+                             color = DIAGNOSIS),
+               size = pt.sz, alpha = 1) + 
+    geom_path(aes(group = HOST_SUBJECT_ID), 
+              color = "black", 
+              size = 0.25) +
+    scale_colour_manual(values = tumorPalette) +
+    theme(text = element_text(size = legTextSize),
+          legend.position="none")
+}
+```
+
+#function to convert phyloseq object to ampvis2 object
+```{r}
+phyloseq_to_ampvis2 <- function(physeq) {
+  #check object for class
+  if(!any(class(physeq) %in% "phyloseq"))
+    stop("physeq object must be of class \"phyloseq\"", call. = FALSE)
+  
+  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
+  if(is.null(physeq@tax_table))
+    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = FALSE)
+  
+  #OTUs must be in rows, not columns
+  if(phyloseq::taxa_are_rows(physeq))
+    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
+  else
+    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
+  
+  #tax_table is assumed to have OTUs in rows too
+  tax <- phyloseq::tax_table(physeq)@.Data
+  
+  #merge by rownames (OTUs)
+  otutable <- merge(
+    abund,
+    tax,
+    by = 0,
+    all.x = TRUE,
+    all.y = FALSE,
+    sort = FALSE
+  )
+  colnames(otutable)[1] <- "OTU"
+  
+  #extract sample_data (metadata)
+  if(!is.null(physeq@sam_data)) {
+    metadata <- data.frame(
+      phyloseq::sample_data(physeq),
+      row.names = phyloseq::sample_names(physeq), 
+      stringsAsFactors = FALSE, 
+      check.names = FALSE
+    )
+    
+    #check if any columns match exactly with rownames
+    #if none matched assume row names are sample identifiers
+    samplesCol <- unlist(lapply(metadata, function(x) {
+      identical(x, rownames(metadata))}))
+    
+    if(any(samplesCol)) {
+      #error if a column matched and it's not the first
+      if(!samplesCol[[1]])
+        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = FALSE)
+    } else {
+      #assume rownames are sample identifiers, merge at the end with name "SampleID"
+      if(any(colnames(metadata) %in% "SampleID"))
+        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = FALSE)
+      metadata$SampleID <- rownames(metadata)
+      
+      #reorder columns so SampleID is the first
+      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = FALSE]
+    }
+  } else
+    metadata <- NULL
+  
+  #extract phylogenetic tree, assumed to be of class "phylo"
+  if(!is.null(physeq@phy_tree)) {
+    tree <- phyloseq::phy_tree(physeq)
+  } else
+    tree <- NULL
+  
+  #extract OTU DNA sequences, assumed to be of class "XStringSet"
+  if(!is.null(physeq@refseq)) {
+    #convert XStringSet to DNAbin using a temporary file (easiest)
+    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
+    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
+  } else
+    fastaTempFile <- NULL
+  
+  #load as normally with amp_load
+  ampvis2::amp_load(
+    otutable = otutable,
+    metadata = metadata,
+    tree = tree,
+    fasta = fastaTempFile
+  )
+}
+```
+
+########################################### DADA2 & PHYLOSEQ PIPELINE ####################################
+#reading in fastq files
+```{r}
+sul1_fastq_files <- "/Volumes/Arena/AMR/sul1_3_25_22/sul1_aes-345539723/sul1_fastq_files" #where  fastq files are
+list.files(sul1_fastq_files) #listing fastq files
+saveRDS(sul1_fastq_files, "sul1_fastq_files.RDS")
+sul1_fastq_files <- readRDS("sul1_fastq_files.RDS")
+```
+
+#filtering + trimming files 
+```{r}
+sul1_fnFs <- sort(list.files(sul1_fastq_files, pattern="_L001_R1_001.fastq.gz")) #forward reads
+sul1_fnRs <- sort(list.files(sul1_fastq_files, pattern="_L001_R2_001.fastq.gz")) #reverse reads
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sampleNames <- sapply(strsplit(sul1_fnFs, "_"), `[`, 1)
+# Specify the full path to the fnFs and fnRs
+sul1_fnFs <- file.path(sul1_fastq_files, sul1_fnFs)
+sul1_fnRs <- file.path(sul1_fastq_files, sul1_fnRs)
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(sul1_fnFs), "_"), `[`, 1)
+sul1_fnFs[1:3]
+sul1_fnRs[1:3]
+```
+
+#looking at Q scores - forward
+```{r}
+plotQualityProfile(sul1_fnFs[1:5])
+```
+
+#looking at Q scores - reverse
+```{r}
+plotQualityProfile(sul1_fnRs[1:5])
+```
+
+trimming and filtering F/R reads
+```{r}
+sul1_filt_path <- file.path(sul1_fastq_files, "sul1_filtered") 
+if(!file_test("-d", sul1_filt_path)) dir.create(sul1_filt_path)
+sul1_filtFs <- file.path(sul1_filt_path, paste0(sampleNames, "_F_filt.fastq.gz"))
+sul1_filtRs <- file.path(sul1_filt_path, paste0(sampleNames, "_R_filt.fastq.gz"))
+library("ShortRead")
+library(Matrix)
+# to check no of files
+#length(sul1_fnFs) #384
+#length(sul1_fnRs) #384
+
+# to check for duplicates
+#any(duplicated(c(sul1_fnFs, sul1_fnRs)))
+#any(duplicated(c(sul1_filtFs, sul1_filtRs)))
+
+#head(sul1_fnFs)
+#head(sul1_fnRs)
+
+#head(sul1_filtFs)
+#head(sul1_filtRs)
+
+#can trim the reads according to what fits your dataset by changing the numbers in 'truncLen=c(240,160)'
+#additionally you can change your maxEE based off of what you are wanting (based off of expected errors)
+sul1_out <- filterAndTrim(sul1_fnFs, sul1_filtFs, sul1_fnRs, sul1_filtRs, truncLen=c(140,100), maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=TRUE, matchIDs = T)
+
+sul1_out
+sul1_fnFs
+sul1_fnRs
+```
+
+```{r}
+saveRDS(sul1_out, "~/Desktop/grad_school/AMR_project/sul1_analysis/sul1_out.RDS")
+write.table(sul1_out, file="sul1_out.RDS", col.names=T, row.names=T, sep = "\t",quote=F) #won't add quotations to headers
+#sul1_out <- readRDS("~/Desktop/grad_school/AMR_project/sul1_analysis/sul1_out.RDS")
+```
+
+# reads in and out after trimming
+```{r}
+sum(sul1_out[,1]) #total reads in---12 875 540
+sum(sul1_out[,2]) #total reads out---12 648 507
+sum(sul1_out[,1]) - sum(sul1_out[,2]) #reads lost---227 033
+sum(sul1_out[,2])/sum(sul1_out[,1]) # percentage data retained --- 0.9823671
+```
+
+#learning error rates
+```{r}
+sul1_exists <- file.exists(sul1_filtFs) & file.exists(sul1_filtRs)
+sul1_filtFs <- sul1_filtFs[sul1_exists]
+sul1_filtRs <- sul1_filtRs[sul1_exists]
+```
+
+#dereplication
+```{r}
+derep_sul1Fs <- derepFastq(sul1_filtFs, verbose=TRUE)
+derep_sul1Rs <- derepFastq(sul1_filtRs, verbose=TRUE)
+head(derep_sul1Fs)
+```
+
+#learning error rates
+```{r}
+names(derep_sul1Fs) <- sampleNames
+names(derep_sul1Rs) <- sampleNames
+sampleNames
+
+sul1_errF <- learnErrors(sul1_filtFs, multithread=TRUE) #error model for forward reads
+sul1_errR <- learnErrors(sul1_filtRs, multithread=TRUE) #error model for reverse reads
+
+plotErrors(sul1_errF)
+plotErrors(sul1_errR)
+
+save(sul1_exists, sul1_filtFs, sul1_filtRs, derep_sul1Fs, derep_sul1Rs, sul1_errF, sul1_errR, file = "error_plots_sul1.rds")
+#load("error_plots_sul1.rds")
+```
+
+#applying the learned error rates
+```{r}
+sul1_dadaFs <- dada(derep_sul1Fs, err=sul1_errF, multithread=TRUE) #run the algorithm on forward fastq + apply error model
+sul1_dadaRs <- dada(derep_sul1Rs, err=sul1_errR, multithread=TRUE)
+```
+
+#merging forward and reverse reads
+```{r}
+merged_FR_sul1 <- mergePairs(sul1_dadaFs, derep_sul1Fs, sul1_dadaRs, derep_sul1Rs, verbose=T) #mergePairs - take info from forward dada algorithm+ add to dereplicated fasta sequences then merge together
+head(merged_FR_sul1[[1]])
+saveRDS(merged_FR_sul1, file = "merged_FR_sul1.rds")
+#merged_FR_sul1 <- readRDS("merged_FR_sul1.RDS")
+```
+
+#constructing an ASV table
+```{r}
+seqtable_sul1 <- makeSequenceTable(merged_FR_sul1)
+dim(seqtable_sul1) #384, 344 (samples, ASVs)
+sample_names(otu_table(seqtable_sul1,taxa_are_rows = F))
+#distribution of sequence lengths
+table(nchar(getSequences(seqtable_sul1)))
+write.table(seqtable_sul1, file="seqtable_sul1.txt", col.names=T, row.names=T, sep = "\t",quote=F)
+
+#removing chimeras 
+seqtable_sul1_chremoved <- removeBimeraDenovo(seqtable_sul1)
+write.table(seqtable_sul1_chremoved, file="seqtab_sul1_chiremoved.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
+sample_names(otu_table(seqtable_sul1_chremoved, taxa_are_rows = F))
+saveRDS(seqtable_sul1_chremoved, file = "seqtab_sul1_chiremoved.rds")
+#seqtable_sul1_chremoved <- readRDS("seqtab_sul1_chiremoved.RDS")
+dim(seqtable_sul1_chremoved) #384 333 (samples, ASVs)
+
+#sum(seqtable_sul1_chremoved)/sum(seqtable_sul1) #0.9998438
+```
+
+#add track table - a good place for a sanity check, reads should not be lost other than filtering 
+```{r}
+getN_sul1 <- function(x) sum(getUniques(x))
+track_sul1 <- cbind(sul1_out, sapply(sul1_dadaFs, getN_sul1), sapply(sul1_dadaRs, getN_sul1), sapply(merged_FR_sul1, getN_sul1), rowSums(seqtable_sul1_chremoved))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track_sul1) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track_sul1) <- sample.names
+head(track_sul1)
+```
+
+#making fasta files + otu tables
+```{r}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+sul1_asv_seqs <- colnames(seqtable_sul1_chremoved)
+sul1_asv_headers <- vector(dim(seqtable_sul1_chremoved)[2], mode="character")
+
+for (i in 1:dim(seqtable_sul1_chremoved)[2]) {
+  sul1_asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+sul1_asv_fasta <- c(rbind(sul1_asv_headers, sul1_asv_seqs))
+write.table(sul1_asv_fasta, "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/ASVs_sul1.fa", row.names=FALSE,sep="\t", quote = FALSE)
+saveRDS(sul1_asv_fasta, "sul1_asv_fasta.RDS")
+
+# count table:
+sul1_asv_tab <- t(seqtable_sul1_chremoved)
+row.names(sul1_asv_tab) <- sub(">", "", sul1_asv_headers)
+write.table(sul1_asv_tab, "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/ASVs_counts_sul1.fa", sep="\t", quote=F)
+saveRDS(sul1_asv_tab, "sul1_asv_tab.RDS")
+#sul1_asv_tab <- readRDS("sul1_asv_tab.RDS")
+```
+
+#putting mapping file in 
+```{r}
+library("readxl") #needs to be loaded explicitly outside of tidyverse
+library("tidyverse")
+
+amr_mappingfile <- "/Users/arenasee/Desktop/grad_school/AMR_project/excel_mapping_info/AMR_MAPPING_ORIENTATION.xlsx"
+sul1_mappingfile <- read_excel(amr_mappingfile, sheet = "sul1_map") #this specifies which sheet to read by name
+View(sul1_mappingfile)
+
+#this shows the classes of the variables 
+str(sul1_mappingfile)
+
+#checking for duplicates in index - can happen when negative controls and samples have same ID
+duplicated(sul1_mappingfile$Sul1_Illumina_Index)
+
+#changing DayOfStudy from character -> factor 
+sul1_mappingfile$DayOfStudy <- as.factor(sul1_mappingfile$DayOfStudy)
+sul1_mappingfile$Treatment <- as.factor(sul1_mappingfile$Treatment)
+```
+
+#making phyloseq object
+```{r}
+#creating metadata 
+sul1_meta <- sample_data(sul1_mappingfile)
+View(sul1_meta)
+sample_names(sul1_meta) = sul1_meta$Sul1_Illumina_Index
+
+#creating OTU table 
+sul1_otu_tab <- otu_table(sul1_asv_tab, taxa_are_rows =TRUE)
+#head(sul1_otu_tab)
+saveRDS(sul1_otu_tab, "sul1_otu_tab.RDS")
+
+#putting together phyloseq objects 
+sul1_phylobj <- phyloseq(sul1_otu_tab, sul1_meta)
+sample_names(otu_table(sul1_otu_tab))
+sample_names(sample_data(sul1_meta))
+
+#saving final object
+saveRDS(sul1_phylobj, file = "sul1_phylobj.rds")
+sul1_phylobj <- readRDS("sul1_phylobj.rds")
+```
+
+#identifying contaminants 
+```{r}
+library(decontam); packageVersion("decontam")
+
+#this step identifies negatives and assigns T/F to them 
+sample_data(sul1_phylobj)$is.neg <- sample_data(sul1_phylobj)$Sample_Type == "NC"
+sul1_contamdf.prev <- isContaminant(sul1_phylobj, method="prevalence", neg="is.neg", batch = sample_data(sul1_phylobj)$Run, batch.combine = "minimum")
+#table(sul1_contamdf.prev$contaminant)
+#sul1_contamdf.prev$contaminant
+#View(sample_data(sul1_phylobj))
+```
+
+#creating list of contaminants
+```{r}
+sul1_removal <- sul1_contamdf.prev[sul1_contamdf.prev$contaminant==FALSE,] #FALSE = non-contaminants, TRUE - contaminants
+sul1_removal_list <- row.names(sul1_removal)
+sul1_ps <- prune_taxa(taxa = sul1_removal_list, sul1_phylobj) 
+#(sum(taxa_sums(sul1_ps)))/(sum(taxa_sums(sul1_phylobj))) #0.9999367
+```
+
+#getting rid of NC samples
+```{r}
+# != means not equals, subset_samples = need to identify samples to keep
+sul1_ps_all <- subset_samples(sul1_ps, Sample_Type !="NC") 
+#View(sample_data(sul1_ps_noNC))
+saveRDS(sul1_ps_all, file = "sul1_ps_all.RDS")
+#sul1_ps_noNC <- readRDS("sul1_ps_noNC.RDS")
+``` 
+
+#prevalence filtration 
+```{r}
+sul1_phylobj.prop <- transform_sample_counts(sul1_ps_noNC, function(x)x/sum(x))
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples - threshold at which we reocver 99% of the data and that we know is real bc it matches references
+flist <- filterfun(kOverA(2, 0.0015))
+
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+sul1_fedlogi <- filter_taxa(sul1_phylobj.prop, flist) #create a list of ASVs that meet flist criteria of 0.015% 
+#will give TRUE/FALSE based on if they meet criteria 
+
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+sul1_filt = prune_taxa(sul1_fedlogi, sul1_phylobj.prop)
+saveRDS(sul1_filt, "sul1_filt.RDS")
+#sul1_filt <- readRDS("sul1_filt.RDS")
+```
+
+#subsetting different sample types as phyloseq objects for further analysis 
+#RUMEN samples
+```{r}
+#subsetting rumen samples
+sul1_ps_rumen <- subset_samples(sul1_filt, Sample_Type=="RUMEN")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(sul1_ps_rumen))
+
+saveRDS(sul1_ps_rumen, file = "sul1_ps_rumen.RDS")
+sul1_ps_rumen <- readRDS("sul1_ps_rumen.RDS")
+```
+
+#FECAL samples
+```{r}
+#subsetting fecal samples
+sul1_ps_fecal <- subset_samples(sul1_filt, Sample_Type=="FECAL")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(sul1_ps_fecal))
+
+saveRDS(sul1_ps_fecal, file = "sul1_ps_fecal.RDS")
+sul1_ps_fecal <- readRDS("sul1_ps_fecal.RDS")
+```
+
+#FSM samples
+```{r}
+#subsetting FSM samples
+sul1_ps_fsm <- subset_samples(sul1_filt, Sample_Type=="FSM")
+
+#checking to see that the right samples have been subsetted
+#View(sample_data(sul1_ps_fsm))
+
+saveRDS(sul1_ps_fsm, file = "sul1_ps_fsm.RDS")
+sul1_ps_fsm <- readRDS("sul1_ps_fsm.RDS") 
+```
+
+#SOIL/RUNOFF 
+```{r}
+#subsetting soil/runoff samples
+sul1_ps_soil <- subset_samples(sul1_filt, Sample_Type=="SOIL/RUNOFF")
+
+#checking to see that the right samples have been subsetted
+#View(sample_data(sul1_ps_soil))
+
+saveRDS(sul1_ps_soil, file = "sul1_ps_soil.RDS")
+sul1_ps_soil <- readRDS("sul1_ps_soil.RDS")
+```
+
+################################### ANALYSIS BY SAMPLE TYPE ######################################
+## RUMEN
+# PCOA + PERMANOVA
+```{r}
+#transform data to proportions
+sul1_rumen.prop <- transform_sample_counts(sul1_ps_rumen, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+sul1_rumen_dist <- phyloseq::distance(sul1_rumen.prop, method="bray")
+
+#making a data frame of sample_data
+sul1_rumen_df <- data.frame(sample_data(sul1_ps_rumen))
+
+#performing permanova
+sul1_rumen_perm <- adonis(t(sul1_rumen_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, 
+                               data = sul1_rumen_df, permutations = 999)
+
+#making table/figure out of the permanova results
+sul1_rumen_permtab <- sul1_rumen_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between rumen microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title = "sul1 Rumen Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_rumen_permtab.pdf")
+```
+
+#RUMEN - beta diversity 
+```{r}
+#perform ordinations
+sul1_rumen.bray <- ordinate(sul1_rumen.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+sul1_rumen_bctreat <- plot_ordination(sul1_rumen.prop, sul1_rumen.bray, color="Treatment") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+sul1_rumen.bctime <- plot_ordination(sul1_rumen.prop, sul1_rumen.bray, color="DayOfStudy") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+
+sul1_rumen_pcoa <- plot_grid(sul1_rumen_bctreat, sul1_rumen.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/sul1_Rumen_Beta.pdf", width=20, height = 20, units = "cm")
+
+saveRDS(sul1_rumen.bray, "sul1_rumen.bray.RDS")
+```
+
+#RUMEN - alpha diversity
+```{r}
+# alpha diversity on unfiltered data
+sul1_rum.uf <- subset_samples(sul1_ps_noNC, Sample_Type=="RUMEN")
+
+#alpha diversity calc table
+sul1_rum_alpha <- estimate_richness(sul1_rum.uf, measures=c("Shannon", "Observed")) 
+sul1_rum_alpha <- merge(as(sample_data(sul1_rum.uf),"matrix") , sul1_rum_alpha, by=0)
+rownames(sul1_rum_alpha) <- sul1_rum_alpha$Row.names
+
+sul1_rum_obsalpha <- ggplot(data = sul1_rum_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+sul1_rum_shanalpha <- ggplot(data = sul1_rum_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+sul1_rum_alphaplot <- plot_grid(sul1_rum_obsalpha, sul1_rum_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/RUM_alpha.pdf", width=20, height = 20, units = "cm")
+
+saveRDS(sul1_rum_alpha, "sul1_rum_alpha.RDS")
+```
+
+#RUMEN - DESEQ heatmap
+```{r}
+#phyloseq object that is not normalised
+sul1_rum.uf 
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+sul1_rum_dds = phyloseq_to_deseq2(sul1_rum.uf, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(sul1_rum_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+sul1_rum_dds = estimateSizeFactors(sul1_rum_dds, geoMeans=geoMeans) 
+sul1_rum_dds = DESeq2::DESeq(sul1_rum_dds, test = "Wald", fitType = "local") 
+
+sul1_rumres=DESeq2::results(sul1_rum_dds)
+DESeq2::resultsNames(sul1_rum_dds)
+sul1_rumres=sul1_rumres[order(sul1_rumres$padj, na.last=NA),]
+alpha = 0.05
+
+sul1_rum.st = sul1_rumres[(sul1_rumres$padj < alpha),]
+data.frame(sul1_rum.st)
+write.table(sul1_rum.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/sul1_rum_st.tsv", sep = "\t")
+```
+
+##########################################FECAL#############################################
+```{r}
+#proportional data 
+sul1_fecal.prop <- transform_sample_counts(sul1_ps_fecal, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+sul1_fecal_dist <- phyloseq::distance(sul1_fecal.prop, method="bray")
+
+#making a data frame of sample_data
+sul1_fecal_df <- data.frame(sample_data(sul1_ps_fecal))
+
+sul1_fecal_perm<- adonis(t(sul1_fecal_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, 
+                               data = sul1_fecal_df, permutations = 999)
+
+#making table/figure out of the permanova results
+sul1_fecal_permtab <- sul1_fecal_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between fecal microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="sul1 Fecal Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_fecal_permtab.pdf")
+```
+
+#beta diversity per sample type - FECAL
+```{r}
+#perform ordinations on proportional data w/ bray-curtis
+sul1_fecal.ord <- ordinate(sul1_fecal.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+sul1_fecal.bctreat <- plot_ordination(sul1_fecal.prop, sul1_fecal.ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+sul1_fecal.bctime <- plot_ordination(sul1_fecal.prop, sul1_fecal.ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+sul1_fecal_pcoa <- plot_grid(sul1_fecal.bctreat, sul1_fecal.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/Fecal_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#FECAL - alpha diversity 
+```{r}
+sul1_fec.uf <- subset_samples(sul1_ps_noNC, Sample_Type=="FECAL")
+
+sul1_fec_alpha <- estimate_richness(sul1_fec.uf, measures=c("Shannon", "Observed"))
+sul1_fec_alpha <- merge(as(sample_data(sul1_fec.uf),"matrix") , sul1_fec_alpha, by=0)
+rownames(sul1_fec_alpha) <- sul1_fec_alpha$Row.names
+
+sul1_fec_obsalpha <- ggplot(data = sul1_fec_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+sul1_fec_shanalpha <- ggplot(data = sul1_fec_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+sul1_fec_alphaplot <- plot_grid(sul1_fec_obsalpha, sul1_fec_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/Fecal_Alpha.pdf", width=20, height = 20, units = "cm")
+```
+
+#FECAL - deseq heatmap  - NO DIFF ASV DETECTED
+```{r}
+#phyloseq object that is not normalised!
+sul1_ps_fecal
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+sul1_fec_dds = phyloseq_to_deseq2(sul1_ps_fecal, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(sul1_fec_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+sul1_fec_dds = estimateSizeFactors(sul1_fec_dds, geoMeans=geoMeans) 
+sul1_fec_dds = DESeq2::DESeq(sul1_fec_dds, test = "Wald", fitType = "local") 
+
+sul1_fecres=DESeq2::results(sul1_fec_dds)
+DESeq2::resultsNames(sul1_fec_dds)
+sul1_fecres=sul1_fecres[order(sul1_fecres$padj, na.last=NA),]
+alpha = 0.05
+
+sul1_fec.st = sul1_fecres[(sul1_fecres$padj < alpha),]
+View(sul1_fec.st)
+write.table(sul1_fec.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/sul1_analysis/sul1_fec_st.tsv", sep = "\t")
+
+#finding top 10 sig diff ASVs
+sul1_fec.top20 <- head(sul1_fec.st, 20)
+
+sul1_fec.df <- as.data.frame(colData(sul1_fec_dds)[c("Treatment", "DayOfStudy")])
+sul1_fec.vsd <- varianceStabilizingTransformation(sul1_fec_dds)
+
+#extract names of differentially abundant ASVs
+names20 <- as.factor(rownames(sul1_fec.top20))
+
+#make a subset of the log transformed counts for the differentially abundant genes
+sul1_fec.top<-assay(sul1_fec.vsd)
+top20fdiff<- sul1_fec.top[rownames(sul1_fec.top) %in% names20, ] 
+
+colnames(sul1_fec.df) <- c("Treatment", "DayOfStudy")
+
+sul1_fec_diffASV <- pheatmap(top20fdiff, scale = "row",
+                                  annotation_col = sul1_fec.df, 
+                                  cluster_rows = T, 
+                                  cluster_cols = F, 
+                                  fontsize_col = 5.5,
+                                  width = 13,
+                                  height = 6,
+                                  fontface_row = "italic",
+                     filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/sul1_fec_diffASV.pdf")
+```
+
+######################################### SOIL ANALYSIS #####################################
+# PERMAMOVA
+```{r}
+#transform to proportional data
+sul1_soil.prop <- transform_sample_counts(sul1_ps_soil, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+sul1_soil_dist <- phyloseq::distance(sul1_soil.prop, method="bray")
+
+#making a data frame of sample_data
+sul1_soil_df <- data.frame(sample_data(sul1_ps_soil))
+
+sul1_soil_perm <- adonis(t(sul1_soil_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, data = sul1_soil_df, permutations = 999)
+
+#making table/figure out of the permanova results
+sul1_soil_permtab <- sul1_soil_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between soil microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title = "sul1 Soil Bray-Curtis PERMANOVA", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_soil_permtab.pdf")
+```
+
+## BETA
+```{r}
+#perform ordinations on proportional data w/ bray-curtis
+sul1_soil_ord <- ordinate(sul1_soil.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+sul1s_treat <- plot_ordination(sul1_soil.prop, sul1_soil_ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+sul1s_time <- plot_ordination(sul1_soil.prop, sul1_soil_ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+sul1s_pcoa <- plot_grid(sul1s_treat, sul1s_time, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/Soil_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+## ALPHA 
+```{r}
+#subset unnormalized ps object
+sul1_soil.uf <- subset_samples(sul1_ps_all, Sample_Type=="SOIL/RUNOFF")
+sul1_soil_base <- subset_samples(sul1_soil.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+sul1_sba <- estimate_richness(sul1_soil_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+sul1_sba<- merge(as(sample_data(sul1_soil_base),"matrix") , sul1_sba, by=0)
+rownames(sul1_sba) <- sul1_sba$Row.names
+
+sul1soilbase_obs <- ggplot(data = sul1_sba, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+sul1soilbase_shan <- ggplot(data = sul1_sba, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+
+#alpha diversity only at days 172, 196, 226
+sul1_soil.tg <- subset_samples(sul1_soil.uf, DayOfStudy!="Day_0")
+
+sul1_soil_alp <- estimate_richness(sul1_soil.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+sul1_soil_alp<- merge(as(sample_data(sul1_soil.tg),"matrix") , sul1_soil_alp, by=0)
+rownames(sul1_soil_alp) <- sul1_soil_alp$Row.names
+
+sul1s_tg_obsalp <- ggplot(data = sul1_soil_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+sul1s_tg_shanalp <- ggplot(data = sul1_soil_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+sul1soil_all <- plot_grid(sul1soilbase_obs,sul1soilbase_shan,sul1s_tg_obsalp, sul1s_tg_shanalp, labels="AUTO", nrow = 2, ncol=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/SOIL_ALL_CombAlpha.pdf", width=35, height = 30, units = "cm")
+```
+
+######################################### FSM #####################################
+#BETA
+```{r}
+sul1_fsm.prop <- transform_sample_counts(sul1_ps_fsm, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+sul1_fsm_ord <- ordinate(sul1_fsm.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+sul1_fsm_treat <- plot_ordination(sul1_fsm.prop, sul1_fsm_ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+sul1_fsm_time <- plot_ordination(sul1_fsm.prop, sul1_fsm_ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+fsm_pcoa <- plot_grid(sul1_fsm_treat, sul1_fsm_time, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/FSM_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+sul1_fsm_dist <- phyloseq::distance(sul1_fsm.prop, method="bray")
+
+#making a data frame of sample_data
+sul1_fsm_df <- data.frame(sample_data(sul1_ps_fsm))
+
+sul1_fsm_perm <- adonis(t(sul1_fsm_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy,data = sul1_fsm_df, permutations = 999)
+
+#making table/figure out of the permanova results
+sul1_fsm_permtab <- sul1_fsm_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between FSM microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="sul1 FSM Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_fsm_permtab.pdf")
+
+#pairwise comparisons between treatments
+sul1_fsm.pc <- pairwise.adonis(sul1_fsm_dist, sul1_fsm_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+sul1_fsm.pctab <- sul1_fsm.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of FSM microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments Significance is determined at p < 0.05.",threeparttable = T, general_title = "sul1 FSM Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_fsm_pctreat.pdf")
+
+#pairwise comparisons between timepoints
+sul1_fsm.pctime <- pairwise.adonis(sul1_fsm_dist, sul1_fsm_df$DayOfStudy, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+sul1_fsm.pctimetab <- sul1_fsm.pctime %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between timepoints of FSM microbiome samples (999 permutations). The statistical model performs a pairwise comparison between timepoints. Significance is determined at p < 0.05.",threeparttable = T, general_title = "sul1 FSM Timepoints - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_fsm_pctime.pdf")
+```
+
+# ALPHA
+```{r}
+sul1_fsm.uf <- subset_samples(sul1_ps_all, Sample_Type=="FSM")
+sul1_fsm_base <- subset_samples(sul1_fsm.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+sul1_base_a <- estimate_richness(sul1_fsm_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+sul1_base_a<- merge(as(sample_data(sul1_fsm_base),"matrix") , sul1_base_a, by=0)
+rownames(sul1_base_a) <- sul1_base_a$Row.names
+
+sul1base_obsalp <- ggplot(data = sul1_base_a, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+sul1base_shanalp <- ggplot(data = sul1_base_a, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+
+#alpha diversity only at days 141, 151
+sul1_fsm.tg <- subset_samples(sul1_fsm.uf, DayOfStudy!="Day_0")
+
+sul1_fsm_alp <- estimate_richness(sul1_fsm.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+sul1_fsm_alp<- merge(as(sample_data(sul1_fsm.tg),"matrix") , sul1_fsm_alp, by=0)
+rownames(sul1_fsm_alp) <- sul1_fsm_alp$Row.names
+
+sul1fsm_tg_obsalp <- ggplot(data = sul1_fsm_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+sul1fsm_tg_shanalp <- ggplot(data = sul1_fsm_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+sul1fsm_all <- plot_grid(sul1base_obsalp,sul1base_shanalp,sul1fsm_tg_obsalp, sul1fsm_tg_shanalp, labels="AUTO", nrow = 2, ncol=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/FSM_ALL_CombAlpha.pdf", width=30, height = 25, units = "cm")
+```
+
+######## all analysis
+#heatmap of asv abundance
+```{r}
+pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/ASV_abund_HM.pdf")
+p <- plot_heatmap(sul1_filt)
+p <- p + theme(legend.position = "right", legend.direction="vertical") 
+dev.off()
+```
+
+# bray curtis
+```{r}
+#transform data to proportions
+sul1_all.prop <- transform_sample_counts(sul1_filt, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+ord <- ordinate(sul1_all.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+sul1_treat <- plot_ordination(sul1_all.prop, ord, color="Treatment") + theme_half_open()  + geom_point(size=3)
+sul1_sample <- plot_ordination(sul1_all.prop, ord, color="Sample_Type") + theme_half_open()  + geom_point(size=3)
+
+sul1_all_pcoa <- plot_grid(sul1_treat, sul1_sample, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/sul1/AllSamples_Beta.pdf", width=25, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+sul1_dist <- phyloseq::distance(sul1_all.prop, method="bray")
+
+#making a data frame of sample_data
+sul1.df <- data.frame(sample_data(sul1_filt))
+
+sul1_perm <- adonis(t(sul1_dist) ~Treatment + Sample_Type + Treatment*Sample_Type,data = sul1.df, permutations = 999)
+
+#making table/figure out of the permanova results
+sul1_permtab <- sul1_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(threeparttable = T, general_title ="sul1 All Samples Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_all_permtab.pdf")
+
+#pairwise comparisons between treatments
+sul1_samp.pc <- pairwise.adonis(sul1_dist, sul1.df$Sample_Type, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+sul1_samp.pctab <- sul1_samp.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general_title = "Sul1 Sample Types - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/sul1_all_pctab.pdf")
+```
+
+# DIFF ABUNDANCE ANALYSIS BY TREATMENT
+```{r}
+#phyloseq object that is not normalised!
+sul1_ps_all
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+sul1_dds_tr = phyloseq_to_deseq2(sul1_ps_all, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(sul1_dds_tr), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+sul1_dds_tr = estimateSizeFactors(sul1_dds_tr,geoMeans=geoMeans) 
+sul1_dds_tr = DESeq2::DESeq(sul1_dds_tr, test = "Wald", fitType = "local") 
+
+s1_res=DESeq2::results(sul1_dds_tr)
+DESeq2::resultsNames(sul1_dds_tr)
+s1_res=s1_res[order(s1_res$padj, na.last=NA),]
+alpha = 0.05
+
+sul1_treat.st = s1_res[(s1_res$padj < alpha),]
+```
+
+# DIFF ABUNDANCE ANALYSIS BY TIMEPOINT
+```{r}
+#phyloseq object that is not normalised!
+sul1_ps_all 
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+sul1_dds_st = phyloseq_to_deseq2(sul1_ps_all, ~Sample_Type) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(sul1_dds_st), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+sul1_dds_st = estimateSizeFactors(sul1_dds_st, geoMeans=geoMeans) 
+sul1_dds_st = DESeq2::DESeq(sul1_dds_st, test = "Wald", fitType = "local") 
+
+sul_st_res=DESeq2::results(sul1_dds_st)
+DESeq2::resultsNames(sul1_dds_st)
+sul_st_res=sul_st_res[order(sul_st_res$padj, na.last=NA),]
+alpha = 0.05
+
+sul1_samp.st = sul_st_res[(sul_st_res$padj < alpha),]
+write.table(sul1_samp.st, file = "DESEQ_samptype_sigtab.tsv", sep = "\t")
+```
+
