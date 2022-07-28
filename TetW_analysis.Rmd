@@ -1,9 +1,4 @@
----
-title: "tetW_analysis"
-author: "Arena See"
-date: '2022-05-22'
-output: html_document
----
+###################################################### TETW ANALYSIS ######################################################
 #loading packages in
 ```{r ,echo=TRUE}
 ###to load packages which are not installed use function install.packages("") or BiocManager::install("")
@@ -89,7 +84,7 @@ pal3 <- c(wes_palette("Royal1", type = "discrete"),
           wes_palette("Cavalcanti1", type = "discrete"))
 ```
 
-###################### FUNCTIONS USED IN ANALYSIS ################################
+############################################ FUNCTIONS USED IN ANALYSIS ######################################################
 ```{r}
 #setting custom geometric mean function with zero/NA tolerance
 gm_mean = function(x, na.rm=TRUE){
@@ -158,94 +153,9 @@ plot_deseq = function(dsdf, alpha = 0.1){
 }
 ```
 
-#function to convert phyloseq object to ampvis2 object
+########################################################## DADA2 FILTRATION PIPELINE ###########################################################
 ```{r}
-phyloseq_to_ampvis2 <- function(physeq) {
-  #check object for class
-  if(!any(class(physeq) %in% "phyloseq"))
-    stop("physeq object must be of class \"phyloseq\"", call. = FALSE)
-  
-  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
-  if(is.null(physeq@tax_table))
-    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = FALSE)
-  
-  #OTUs must be in rows, not columns
-  if(phyloseq::taxa_are_rows(physeq))
-    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
-  else
-    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
-  
-  #tax_table is assumed to have OTUs in rows too
-  tax <- phyloseq::tax_table(physeq)@.Data
-  
-  #merge by rownames (OTUs)
-  otutable <- merge(
-    abund,
-    tax,
-    by = 0,
-    all.x = TRUE,
-    all.y = FALSE,
-    sort = FALSE
-  )
-  colnames(otutable)[1] <- "OTU"
-  
-  #extract sample_data (metadata)
-  if(!is.null(physeq@sam_data)) {
-    metadata <- data.frame(
-      phyloseq::sample_data(physeq),
-      row.names = phyloseq::sample_names(physeq), 
-      stringsAsFactors = FALSE, 
-      check.names = FALSE
-    )
-    
-    #check if any columns match exactly with rownames
-    #if none matched assume row names are sample identifiers
-    samplesCol <- unlist(lapply(metadata, function(x) {
-      identical(x, rownames(metadata))}))
-    
-    if(any(samplesCol)) {
-      #error if a column matched and it's not the first
-      if(!samplesCol[[1]])
-        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = FALSE)
-    } else {
-      #assume rownames are sample identifiers, merge at the end with name "SampleID"
-      if(any(colnames(metadata) %in% "SampleID"))
-        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = FALSE)
-      metadata$SampleID <- rownames(metadata)
-      
-      #reorder columns so SampleID is the first
-      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = FALSE]
-    }
-  } else
-    metadata <- NULL
-  
-  #extract phylogenetic tree, assumed to be of class "phylo"
-  if(!is.null(physeq@phy_tree)) {
-    tree <- phyloseq::phy_tree(physeq)
-  } else
-    tree <- NULL
-  
-  #extract OTU DNA sequences, assumed to be of class "XStringSet"
-  if(!is.null(physeq@refseq)) {
-    #convert XStringSet to DNAbin using a temporary file (easiest)
-    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
-    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
-  } else
-    fastaTempFile <- NULL
-  
-  #load as normally with amp_load
-  ampvis2::amp_load(
-    otutable = otutable,
-    metadata = metadata,
-    tree = tree,
-    fasta = fastaTempFile
-  )
-}
-```
-
-#################################### DADA2 FILTRATION PIPELINE #####################################
-```{r}
-TetW_fastq_files <- "/Volumes/AESexternal/AMR/TetW_5_20_22/TetW_redo_AES-350564332/TetW_fastq" #list directory where fastq files are 
+TetW_fastq_files <- "/filepath/TetW_fastq" #list directory where fastq files are 
 list.files(TetW_fastq_files) #listing fastq files
 saveRDS(TetW_fastq_files, "TetW_fastq_files.RDS")
 #TetW_fastq_files <- readRDS("TetW_fastq_files.RDS")
@@ -306,7 +216,7 @@ TetW_out
 TetW_fnFs
 TetW_fnRs
 
-saveRDS(TetW_out, "~/Desktop/grad_school/AMR_project/TetW_analysis/TetW_out.RDS")
+saveRDS(TetW_out, "~/filepath/TetW_out.RDS")
 write.table(TetW_out, file="TetW_out.txt", col.names=T, row.names=T, sep = "\t",quote=F) #won't add quotations to headers
 #TetW_out <- readRDS("TetW_out.RDS")
 ```
@@ -406,14 +316,14 @@ for (i in 1:dim(seqtable_TetW_chremoved)[2]) {
 
 # making and writing out a fasta of our final ASV seqs - ALL ASV SEQ
 TetW_asv_fasta <- c(rbind(TetW_asv_headers, TetW_asv_seqs))
-write.table(TetW_asv_fasta, "/Users/arenasee/Desktop/grad_school/AMR_project/TetW_analysis/ASVs_TetW.fa", row.names=FALSE,sep="\t", quote = FALSE)
+write.table(TetW_asv_fasta, "/filepath/ASVs_TetW.fa", row.names=FALSE,sep="\t", quote = FALSE)
 saveRDS(TetW_asv_fasta, "TetW_asv_fasta.RDS")
 #TetW_asv_fasta <- readRDS("TetW_asv_fasta.RDS")
 
 # count table:
 TetW_asv_tab <- t(seqtable_TetW_chremoved)
 row.names(TetW_asv_tab) <- sub(">", "", TetW_asv_headers)
-write.table(TetW_asv_tab, "/Users/arenasee/Desktop/grad_school/AMR_project/TetW_analysis/ASVs_counts_TetW.fa", sep="\t", quote=F)
+write.table(TetW_asv_tab, "/filepath/ASVs_counts_TetW.fa", sep="\t", quote=F)
 saveRDS(TetW_asv_tab, "TetW_asv_tab.RDS")
 #TetW_asv_tab <- readRDS("TetW_asv_tab.rds")
 ```
@@ -423,7 +333,7 @@ saveRDS(TetW_asv_tab, "TetW_asv_tab.RDS")
 library("readxl") #needs to be loaded explicitly outside of tidyverse
 library("tidyverse")
 
-amr_mappingfile <- "/Users/arenasee/Desktop/grad_school/AMR_project/excel_mapping_info/AMR_MAPPING_ORIENTATION.xlsx"
+amr_mappingfile <- "/filepath/AMR_MAPPING_ORIENTATION.xlsx"
 tetW_map <- read_excel(amr_mappingfile, sheet = "TetW_map") #this specifies which sheet to read by name
 View(tetW_map)
 
@@ -932,16 +842,16 @@ tetw_fec_diffASV <- pheatmap(top20fdiff, scale = "row",
 
 ```
 
-### ANALYSIS OF ALL SAMPLES
+################################################### ANALYSIS OF ALL SAMPLES ###################################################
 # heatmap to look at ASV abundance
 ```{r}
-pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/ASV_abund_HM.pdf")
+pdf("/filepath/ASV_abund_HM.pdf")
 p <- plot_heatmap(tetw_filt)
 p <- p + theme(legend.position = "right", legend.direction="vertical") 
 dev.off()
 ```
 
-#PHEATMAP 
+#pheatmap to look at ASV abundance 
 ```{r}
 # set sample order
 #sample_data(tetw_filt)$DayOfStudy <- factor(sample_data(tetw_filt)$DayOfStudy, levels = c("Day_0", "Day_42", "Day_141","Day_154","Day_172","Day_"))
@@ -974,14 +884,6 @@ tetw_pheat <- pheatmap(m, scale = "row",
                           clustering_distance_rows = "euclidean",
                          fontface_row = "italic",                       
                        filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/TetW/heatmap.pdf")
-```
-
-
-
-
-#heatmap by sample type
-```{r}
-plot_heatmap(tetw_ps_rumen, sample.label="DayOfStudy", sample.order="DayOfStudy")
 ```
 
 # bray curtis
@@ -1029,7 +931,7 @@ shannon <- plot_grid(tetw_rum_obsalpha, tetw_fec_obsalpha, tetsoil_obs, tetfsm_o
 ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/tetw/Tetw_Alpha.pdf", width=20, height = 20, units = "cm")
 ```
 
-#DESEQ heatmap -- comparison between treatments
+#DESEQ -- comparison between treatments
 ```{r}
 #phyloseq object that is not normalised!
 tetw_ps_all
@@ -1054,9 +956,6 @@ tetw_tr_df <- as.data.frame(colData(tw_dds_tr)[c("Treatment", "Sample_Type")])
 tetw_tr.vsd <- varianceStabilizingTransformation(tw_dds_tr)
 tetw_tr.prop <- as(otu_table(transform_sample_counts(tetw_ps_all, function(x) x/sum(x))), "matrix")
 View(tetw_tr.prop)
-
-#finding top 10 sig diff ASVs
-tetw_top20.tr <- head(tetw_treat.st, 20)
 ```
 
 #DESEQ comparison between sample types
@@ -1080,32 +979,3 @@ tetw_samp.st = tw_res[(tw_res$padj < alpha),]
 View(tetw_samp.st)
 write.table(tetw_samp.st, file = "DESEQ_sampletype_sigtab.tsv", sep = "\t")
 ```
-
-################################## MERGING ASV TABLES FOR NET ANALYSIS ################################
-```{r}
-#original phyloseq objects had illumina indexes as rownames - had to be reordered according to tube no (which must match exactly) 
-R16s_ps_reord <- set_sample_order(R16s_inj_phylobj, "Tube")
-tetw_rum_reord <- set_sample_order(tetw_ps_rumen, "Tube")
-
-## merging ASV tables
-merged_otu <- merge_phyloseq_pair(otu_table(tetw_rum_reord), otu_table(R16s_ps_reord))
-write.table(merged_otu, file="merged_otu.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
-```   
-
-#fecal
-```{r}
-#F16s_inj_phylobj <- readRDS("F16s_inj_phylobj.RDS")
-
-#adding "T_" to TetW ASVs so they can be differentiated from 16s ASVs
-taxa_names(tetw_ps_fecal) <- paste("T_", taxa_names(tetw_ps_fecal), sep="")
-taxa_names(tetw_ps_fecal)
-
-#setting sample # according to tube no
-F16s_ps_reord <- set_sample_order(F16s_inj_phylobj, "Tube")
-tetw_fec_reord <- set_sample_order(tetw_ps_fecal, "Tube")
-
-## merging ASV tables
-F16s_tet.asv <- merge_phyloseq_pair(otu_table(F16s_ps_reord), otu_table(tetw_fec_reord))
-write.table(F16s_tet.asv, file="F16s_tet.asv.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
-```
-
