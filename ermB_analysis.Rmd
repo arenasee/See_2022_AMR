@@ -1,0 +1,1420 @@
+---
+title: "ermB_analysis"
+author: "Arena See"
+date: "2/27/2022"
+output: html_document
+---
+
+```{r}
+library("BiocManager")
+library("import")
+library("knitr")
+library("BiocStyle")
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+library("phyloseq")
+library("DECIPHER")
+library("ape")
+library("phangorn")
+library("ShortRead")
+library("pairwiseAdonis")
+library("vegan")
+library("cowplot")
+library("kableExtra")
+library("plyr"); packageVersion("plyr")
+library("data.table"); packageVersion("data.table")
+library( "DESeq2" )
+library("ggrepel")
+library("ggpubr")
+library("genefilter")
+set.seed(711L)
+```
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library("knitr")
+library("BiocStyle")
+.cran_packages <- c("ggplot2", "gridExtra")
+.bioc_packages <- c("dada2", "phyloseq", "DECIPHER", "phangorn")
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+   install.packages(.cran_packages[!.inst])
+}
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+   source("http://bioconductor.org/biocLite.R")
+   biocLite(.bioc_packages[!.inst], ask = F)
+}
+# Load packages into session, and print package version
+sapply(c(.cran_packages, .bioc_packages), require, character.only = TRUE)
+```
+
+############################### SETTING COLOR PALETTE FOR PLOTS
+```{r}
+plotTextSize = 9
+legTextSize = 7
+theme_set(theme_bw() + 
+            theme(text = element_text(size = plotTextSize),
+                  legend.text = element_text(size = legTextSize),
+                  legend.position = "top",
+                  legend.direction = "horizontal",
+                  legend.margin = margin(t = 0, b = -0.75, unit='line'),
+                  axis.title.x = element_text(margin=margin(0.3, 0, 0, 0, unit = "lines")),
+                  axis.title.y = element_text(margin=margin(0, 0.3, 0, 0, unit = "lines")),
+                  panel.spacing = margin(t = 0, unit='line'),
+                  plot.margin = unit(x = c(0.25, 0.2, 0.5, 0.1),
+                                     units="line")
+            )
+)
+tumorPalette = c(Healthy = "chartreuse4",
+                 Tumor = "lightgray")
+
+library(wesanderson)
+pal <- wes_palette("Zissou1", 100, type = "continuous")
+pal2 <- wes_palette("Cavalcanti1",100,type="continuous")
+pal3 <- c(wes_palette("Royal1", type = "discrete"),
+          wes_palette("Chevalier1", type = "discrete"),
+          wes_palette("FantasticFox1",type = "discrete"),
+          wes_palette("IsleofDogs1", type = "discrete"),
+          wes_palette("BottleRocket1", type = "discrete"),
+          wes_palette("Rushmore1", type = "discrete"),
+          wes_palette("Darjeeling1", type = "discrete"),
+          wes_palette("Moonrise1", type = "discrete"),
+          wes_palette("GrandBudapest1", type = "discrete"),
+          wes_palette("Cavalcanti1", type = "discrete"))
+```
+
+###################### FUNCTIONS USED IN ANALYSIS
+```{r}
+#setting custom geometric mean function with zero/NA tolerance
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+#phyloseq_clr code
+library(compositions)
+zero_comp = function(x){
+  if(taxa_are_rows(x)){x <- t(x)}
+  matx = otu_table(x)
+  # `zCompositions::cmultRepl` expects the samples to be in rows and OTUs to be in columns 
+  matxzc = zCompositions::cmultRepl(matx, method="CZM", output="counts")
+  otu_table(x) <- otu_table(matxzc, taxa_are_rows = FALSE)
+  return(x)
+}
+
+# CLR definition
+geometric_mean = function(x){
+  exp(mean(log(x)))
+}
+clr = function(x, base=2){
+  x <- log((x / geometric_mean(x)), base)
+}
+phyloseq_CLR = function(physeq){
+  suppressMessages({physeq <- zero_comp(physeq)})
+  return(transform_sample_counts(physeq, fun = clr))
+}
+```
+
+#function for plot table of significant values
+```{r}
+plot_deseq = function(dsdf, alpha = 0.1){
+  # Phylum order
+  x = tapply(dsdf$log2FoldChange, dsdf$Phylum, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Phylum <- factor(as.character(dsdf$Phylum), levels=names(x))
+  # Genus order
+  x = tapply(dsdf$log2FoldChange, dsdf$Genus, function(x){max(x)})
+  x = sort(x, TRUE)
+  dsdf$Genus <- factor(as.character(dsdf$Genus), levels=names(x))
+  # Define the special points worth highlighting
+  specialdf = dsdf[(dsdf$pvalue < alpha), ]
+  specialdf$OTU <- row.names(specialdf)
+  # Now define the ggplot2 object.
+  p = ggplot(
+    data = dsdf, 
+    mapping = aes(x = log2FoldChange,
+                  y = -log10(pvalue),
+                  size = -log10(pvalue))
+    ) + 
+    geom_vline(xintercept = 0.0, linetype = 2) +
+      # the background of all results
+    geom_point(color = "black", alpha = 0.65) + 
+      # the few interesting, borderline significant results
+    geom_point(data = specialdf,
+               mapping = aes(color = Family)) +
+    geom_text_repel(data = specialdf,
+                    mapping = aes(label = paste(OTU, Genus))) +
+    scale_size_continuous(range = c(1, 4)) +
+    guides(size=FALSE) +
+    # axis labels
+    labs(y = expression(-log[10](p)),
+         x = expression(log[2](FC)))
+  return(p)
+}
+```
+
+#setting ordination plot theme
+```{r}
+add_theme = function(p, pt.sz = 3){
+  require("ggplot2")
+  # guides(fill=FALSE)
+  # Add consistent layers/themes
+  p + 
+    geom_point(mapping = aes(shape = DIAGNOSIS, 
+                             color = DIAGNOSIS),
+               size = pt.sz, alpha = 1) + 
+    geom_path(aes(group = HOST_SUBJECT_ID), 
+              color = "black", 
+              size = 0.25) +
+    scale_colour_manual(values = tumorPalette) +
+    theme(text = element_text(size = legTextSize),
+          legend.position="none")
+}
+```
+
+#function to convert phyloseq object to ampvis2 object
+```{r}
+phyloseq_to_ampvis2 <- function(physeq) {
+  #check object for class
+  if(!any(class(physeq) %in% "phyloseq"))
+    stop("physeq object must be of class \"phyloseq\"", call. = FALSE)
+  
+  #ampvis2 requires taxonomy and abundance table, phyloseq checks for the latter
+  if(is.null(physeq@tax_table))
+    stop("No taxonomy found in the phyloseq object and is required for ampvis2", call. = FALSE)
+  
+  #OTUs must be in rows, not columns
+  if(phyloseq::taxa_are_rows(physeq))
+    abund <- as.data.frame(phyloseq::otu_table(physeq)@.Data)
+  else
+    abund <- as.data.frame(t(phyloseq::otu_table(physeq)@.Data))
+  
+  #tax_table is assumed to have OTUs in rows too
+  tax <- phyloseq::tax_table(physeq)@.Data
+  
+  #merge by rownames (OTUs)
+  otutable <- merge(
+    abund,
+    tax,
+    by = 0,
+    all.x = TRUE,
+    all.y = FALSE,
+    sort = FALSE
+  )
+  colnames(otutable)[1] <- "OTU"
+  
+  #extract sample_data (metadata)
+  if(!is.null(physeq@sam_data)) {
+    metadata <- data.frame(
+      phyloseq::sample_data(physeq),
+      row.names = phyloseq::sample_names(physeq), 
+      stringsAsFactors = FALSE, 
+      check.names = FALSE
+    )
+    
+    #check if any columns match exactly with rownames
+    #if none matched assume row names are sample identifiers
+    samplesCol <- unlist(lapply(metadata, function(x) {
+      identical(x, rownames(metadata))}))
+    
+    if(any(samplesCol)) {
+      #error if a column matched and it's not the first
+      if(!samplesCol[[1]])
+        stop("Sample ID's must be in the first column in the sample metadata, please reorder", call. = FALSE)
+    } else {
+      #assume rownames are sample identifiers, merge at the end with name "SampleID"
+      if(any(colnames(metadata) %in% "SampleID"))
+        stop("A column in the sample metadata is already named \"SampleID\" but does not seem to contain sample ID's", call. = FALSE)
+      metadata$SampleID <- rownames(metadata)
+      
+      #reorder columns so SampleID is the first
+      metadata <- metadata[, c(which(colnames(metadata) %in% "SampleID"), 1:(ncol(metadata)-1L)), drop = FALSE]
+    }
+  } else
+    metadata <- NULL
+  
+  #extract phylogenetic tree, assumed to be of class "phylo"
+  if(!is.null(physeq@phy_tree)) {
+    tree <- phyloseq::phy_tree(physeq)
+  } else
+    tree <- NULL
+  
+  #extract OTU DNA sequences, assumed to be of class "XStringSet"
+  if(!is.null(physeq@refseq)) {
+    #convert XStringSet to DNAbin using a temporary file (easiest)
+    fastaTempFile <- tempfile(pattern = "ampvis2_", fileext = ".fa")
+    Biostrings::writeXStringSet(physeq@refseq, filepath = fastaTempFile)
+  } else
+    fastaTempFile <- NULL
+  
+  #load as normally with amp_load
+  ampvis2::amp_load(
+    otutable = otutable,
+    metadata = metadata,
+    tree = tree,
+    fasta = fastaTempFile
+  )
+}
+```
+
+######################################### DADA2 & PHYLOSEQ PIPELINES
+#reading in fastq files
+```{r}
+ermB_fastq_files <- "/Volumes/Arena/AMR/ermB_2_24_22/ermB_redo_aes-335090892/ermB_fastq" #where  fastq files are
+list.files(ermB_fastq_files) #listing fastq files
+saveRDS(ermB_fastq_files, "ermB_fastq_files.RDS")
+#ermB_fastq_files <- readRDS("ermB_fastq_files.RDS")
+```
+
+#filtering + trimming files
+```{r}
+ermB_fnFs <- sort(list.files(ermB_fastq_files, pattern="_L001_R1_001.fastq.gz")) #forward reads
+ermB_fnRs <- sort(list.files(ermB_fastq_files, pattern="_L001_R2_001.fastq.gz")) #reverse reads
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sampleNames <- sapply(strsplit(ermB_fnFs, "_"), `[`, 1)
+# Specify the full path to the fnFs and fnRs
+ermB_fnFs <- file.path(ermB_fastq_files, ermB_fnFs)
+ermB_fnRs <- file.path(ermB_fastq_files, ermB_fnRs)
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(ermB_fnFs), "_"), `[`, 1)
+ermB_fnFs[1:3]
+ermB_fnRs[1:3]
+```
+
+#looking at Q scores - forward
+```{r}
+plotQualityProfile(ermB_fnFs[1:5]) #this function plots a visual summary of the distribution of quality scores as a function of sequence position for the input fastq file
+```
+
+#looking at Q scores - reverse
+```{r}
+plotQualityProfile(ermB_fnRs[1:5]) #this function plots a visual summary of the distribution of quality scores as a function of sequence position for the input fastq file
+```
+
+trimming and filtering F/R reads
+```{r}
+ermB_filt_path <- file.path(ermB_fastq_files, "ermB_filtered") 
+if(!file_test("-d", ermB_filt_path)) dir.create(ermB_filt_path)
+ermB_filtFs <- file.path(ermB_filt_path, paste0(sampleNames, "_F_filt.fastq.gz"))
+ermB_filtRs <- file.path(ermB_filt_path, paste0(sampleNames, "_R_filt.fastq.gz"))
+library("ShortRead")
+library(Matrix)
+# to check no of files
+#length(ermB_fnFs) #384
+#length(ermB_fnRs) #384
+
+# to check for duplicates
+#any(duplicated(c(ermB_fnFs, ermB_fnRs)))
+#any(duplicated(c(ermB_filtFs, ermB_filtRs)))
+
+#head(ermB_fnFs)
+#head(ermB_fnRs)
+
+#head(ermB_filtFs)
+#head(ermB_filtRs)
+
+#can trim the reads according to what fits your dataset by changing the numbers in 'truncLen=c(240,160)'
+#additionally you can change your maxEE based off of what you are wanting (based off of expected errors)
+ermB_out <- filterAndTrim(ermB_fnFs, ermB_filtFs, ermB_fnRs, ermB_filtRs, truncLen=c(220,70), 
+                  maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                  compress=TRUE, multithread=TRUE, matchIDs = T)
+ermB_out
+ermB_fnFs
+ermB_fnRs
+```
+
+```{r}
+saveRDS(ermB_out, "~/Desktop/grad_school/AMR_project/ermB_analysis/ermB_out.RDS")
+write.table(ermB_out, file="ermB_out.RDS", col.names=T, row.names=T, sep = "\t",quote=F) #won't add quotations to headers
+#ermB_out <- readRDS("~/Desktop/grad_school/AMR_project/ermB_analysis/ermB_out.RDS")
+```
+
+# reads in and out after trimming
+```{r}
+sum(ermB_out[,1]) #total reads in---14 279 506
+sum(ermB_out[,2]) #total reads out--- 14 045 553
+sum(ermB_out[,1]) - sum(ermB_out[,2]) #reads lost---233 953
+sum(ermB_out[,2])/sum(ermB_out[,1]) # percentage data retained --- 0.9836162
+```
+
+#learning error rates
+```{r}
+ermB_exists <- file.exists(ermB_filtFs) & file.exists(ermB_filtRs)
+ermB_filtFs <- ermB_filtFs[ermB_exists]
+ermB_filtRs <- ermB_filtRs[ermB_exists]
+```
+
+#dereplication
+```{r}
+derep_ermBFs <- derepFastq(ermB_filtFs, verbose=TRUE)
+derep_ermBRs <- derepFastq(ermB_filtRs, verbose=TRUE)
+head(derep_ermBFs)
+```
+
+#learning error rates
+```{r}
+names(derep_ermBFs) <- sampleNames
+names(derep_ermBRs) <- sampleNames
+sampleNames
+
+ermB_errF <- learnErrors(ermB_filtFs, multithread=TRUE) #error model for forward reads
+ermB_errR <- learnErrors(ermB_filtRs, multithread=TRUE) #error model for reverse reads
+
+plotErrors(ermB_errF)
+plotErrors(ermB_errR)
+
+save(ermB_exists, ermB_filtFs, ermB_filtRs, derep_ermBFs, derep_ermBRs, ermB_errF, ermB_errR, file = "error_plots_ermB.rds")
+#load("error_plots_ermB.rds")
+```
+
+#applying the learned error rates
+```{r}
+ermB_dadaFs <- dada(derep_ermBFs, err=ermB_errF, multithread=TRUE) #run the algorithm on forward fastq + apply error model
+ermB_dadaRs <- dada(derep_ermBRs, err=ermB_errR, multithread=TRUE)
+```
+
+#merging forward and reverse reads
+```{r}
+merged_FR_ermB <- mergePairs(ermB_dadaFs, derep_ermBFs, ermB_dadaRs, derep_ermBRs, verbose=T) #mergePairs - take info from forward dada algorithm+ add to dereplicated fasta sequences then merge together
+head(merged_FR_ermB[[1]])
+saveRDS(merged_FR_ermB, file = "merged_FR_ermB.RDS")
+#merged_FR_ermB <- readRDS("merged_FR_ermB.RDS")
+```
+
+#constructing an ASV table
+```{r}
+seqtable_ermB <- makeSequenceTable(merged_FR_ermB)
+dim(seqtable_ermB) #384, 919 (samples, ASVs)
+sample_names(otu_table(seqtable_ermB,taxa_are_rows = F))
+#distribution of sequence lengths
+table(nchar(getSequences(seqtable_ermB)))
+write.table(seqtable_ermB, file="seqtable_ermB.txt", col.names=T, row.names=T, sep = "\t",quote=F)
+
+#removing chimeras 
+seqtable_ermB_chremoved <- removeBimeraDenovo(seqtable_ermB)
+write.table(seqtable_ermB_chremoved, file="seqtab_ermB_chiremoved.txt", col.names=NA, row.names=T, sep = "\t",quote=F)
+sample_names(otu_table(seqtable_ermB_chremoved, taxa_are_rows = F))
+saveRDS(seqtable_ermB_chremoved, file = "seqtab_ermB_chiremoved.RDS")
+#seqtable_ermB_chremoved <- readRDS("seqtab_ermB_chiremoved.rds")
+dim(seqtable_ermB_chremoved) #384 719 (samples, ASVs)
+
+#sum(seqtable_ermB_chremoved)/sum(seqtable_ermB) #0.9664245
+```
+
+#add track table - a good place for a sanity check, reads should not be lost other than filtering
+```{r}
+getN_ermB <- function(x) sum(getUniques(x))
+track_ermB <- cbind(ermB_out, sapply(ermB_dadaFs, getN_ermB), sapply(ermB_dadaRs, getN_ermB), sapply(merged_FR_ermB, getN_ermB), rowSums(seqtable_ermB_chremoved))
+colnames(track_ermB) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track_ermB) <- sample.names
+head(track_ermB)
+```
+
+#making fasta files + otu tables
+```{r}
+ # giving our seq headers more manageable names (ASV_1, ASV_2...)
+ermB_asv_seqs <- colnames(seqtable_ermB_chremoved)
+ermB_asv_headers <- vector(dim(seqtable_ermB_chremoved)[2], mode="character")
+
+for (i in 1:dim(seqtable_ermB_chremoved)[2]) {
+  ermB_asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+  # making and writing out a fasta of our final ASV seqs:
+ermB_asv_fasta <- c(rbind(ermB_asv_headers, ermB_asv_seqs))
+write(ermB_asv_fasta, "/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ASVs_ermB.fa")
+saveRDS(ermB_asv_fasta, "ermB_asv_fasta.RDS")
+#ermB_asv_fasta <- readRDS("ermB_asv_fasta.RDS")
+
+  # count table:
+ermB_asv_tab <- t(seqtable_ermB_chremoved)
+row.names(ermB_asv_tab) <- sub(">", "", ermB_asv_headers)
+write.table(ermB_asv_tab, "/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ASVs_counts_ermB.fa", sep="\t", quote=F)
+saveRDS(ermB_asv_tab, "ermB_asv_tab.RDS")
+#ermB_asv_tab <- readRDS("ermB_asv_tab.RDS")
+```
+
+#putting mapping file in
+```{r}
+library("readxl") #needs to be loaded explicitly outside of tidyverse
+library("tidyverse")
+
+amr_mappingfile <- "/Users/arenasee/Desktop/grad_school/AMR_project/excel_mapping_info/AMR_MAPPING_ORIENTATION.xlsx"
+ermB_mappingfile <- read_excel(amr_mappingfile, sheet = "ermB_map") #this specifies which sheet to read by name
+View(ermB_mappingfile)
+#this shows the structure of the variables 
+str(ermB_mappingfile)
+
+#changing DayOfStudy from character -> factor 
+ermB_mappingfile$DayOfStudy <- as.factor(ermB_mappingfile$DayOfStudy)
+ermB_mappingfile$Treatment <- as.factor(ermB_mappingfile$Treatment)
+```
+
+#making phyloseq object
+```{r}
+#creating metadata 
+ermB_meta <- sample_data(ermB_mappingfile)
+sample_names(ermB_meta) = ermB_meta$ermB_Illumina_Index
+View(ermB_meta)
+
+#creating OTU table 
+ermB_otu_tab <- otu_table(ermB_asv_tab, taxa_are_rows =TRUE)
+saveRDS(ermB_otu_tab, "ermB_otu_tab.RDS")
+#head(ermB_otu_tab)
+
+#putting together phyloseq objects - no tax table for now, need to figure out MEGARES alignment
+ermB_phylobj <- phyloseq(ermB_otu_tab, ermB_meta)
+sample_names(otu_table(ermB_otu_tab))
+sample_names(sample_data(ermB_meta))
+
+#saving final object
+saveRDS(ermB_phylobj, file = "ermB_phylobj.rds")
+#ermB_phylobj <- readRDS("ermB_phylobj.rds")
+```
+
+#identifying contaminants
+```{r}
+library(decontam); packageVersion("decontam")
+
+#this step identifies negatives and assigns T/F to them 
+sample_data(ermB_phylobj)$is.neg <- sample_data(ermB_phylobj)$Sample_Type == "NC"
+ermB_contamdf.prev <- isContaminant(ermB_phylobj, method="prevalence", neg="is.neg", batch = sample_data(ermB_phylobj)$Run, batch.combine = "minimum")
+#table(ermB_contamdf.prev$contaminant)
+#View(ermB_contamdf.prev$contaminant)
+#View(sample_data(ermB_phylobj))
+```
+
+#creating list of contaminants
+```{r}
+ermB_removal <- ermB_contamdf.prev[ermB_contamdf.prev$contaminant==FALSE,] #FALSE = non-contaminants, TRUE - contaminants
+ermB_removal_list <- row.names(ermB_removal)
+ermB_ps <- prune_taxa(taxa = ermB_removal_list, ermB_phylobj) 
+#(sum(taxa_sums(ermB_ps)))/(sum(taxa_sums(ermB_phylobj))) #0.8633859
+```
+
+#getting rid of NC samples
+```{r}
+# != means not equals, subset_samples = need to identify samples to keep
+ermB_ps_all <- subset_samples(ermB_ps, Sample_Type !="NC") 
+#View(sample_data(ermB_ps_noNC))
+saveRDS(ermB_ps_all, file = "ermB_ps_all.RDS")
+ermB_ps_all <- readRDS("ermB_ps_all.RDS")
+```
+
+#prevalence filtration
+```{r}
+library("genefilter")
+ermB_phylobj.prop <- transform_sample_counts(ermB_ps_all, function(x)x/sum(x))
+#set the function parameters, 0.15% abundance w/in a sample, and must have that criteria in at least 2 samples - threshold at which we reocver 99% of the data and that we know is real bc it matches references
+flist <- filterfun(kOverA(2, 0.0015))
+
+#Use function on your data:
+#this should be performed on your asv table transformed to proportional data
+ermB_fedlogi <- filter_taxa(ermB_phylobj.prop, flist) #create a list of ASVs that meet flist criteria of 0.015% 
+#will give TRUE/FALSE based on if they meet criteria 
+
+#Now filter out ASVs that do not meet the criteria kOverA i.e. dd2.logi list...
+ermB_filt = prune_taxa(ermB_fedlogi, ermB_phylobj.prop)
+saveRDS(ermB_filt, "ermB_filt.RDS")
+ermB_filt <- readRDS("ermB_filt.RDS")
+```
+
+#filtered ASV table
+```{r}
+#fasta file of filtered ASVs was made in text editor manually 
+ermB.fa <- read.table("ermB_ASV_filt.fa")
+# ASV table was annotated against MegaRes database for ermB to ensure that all were ermB sequences
+#low query cover observed but high percent identity
+#query coverage = % of the contig length that aligns with the ncbi hit - small % means only a tiny portion of the contig is aligning
+#percent identity = the % of bases that are identical to the reference genome, a query sequence can have a low % identity but still be a real hit
+```
+
+#subsetting different sample types as phyloseq objects for further analysis #RUMEN samples
+```{r}
+#subsetting rumen samples
+ermB_ps_rumen <- subset_samples(ermB_filt, Sample_Type=="RUMEN")
+
+#checking to see that the right samples have been subsetted
+data.frame(sample_data(ermB_ps_rumen))
+
+saveRDS(ermB_ps_rumen, file = "ermB_ps_rumen.RDS")
+ermB_ps_rumen <- readRDS('ermB_ps_rumen.RDS')
+```
+
+#FECAL samples
+```{r}
+#subsetting fecal samples
+ermB_ps_fecal <- subset_samples(ermB_filt, Sample_Type=="FECAL")
+
+#checking to see that the right samples have been subsetted
+#data.frame(sample_data(ermB_ps_fecal))
+
+saveRDS(ermB_ps_fecal, file = "ermB_ps_fecal.RDS")
+ermB_ps_fecal <- readRDS("ermB_ps_fecal.RDS")
+```
+
+#FSM samples
+```{r}
+#subsetting FSM samples
+ermB_ps_fsm <- subset_samples(ermB_filt, Sample_Type=="FSM")
+
+#checking to see that the right samples have been subsetted
+View(sample_data(ermB_ps_fsm))
+
+saveRDS(ermB_ps_fsm, file = "ermB_ps_fsm.RDS")
+ermB_ps_fsm <- readRDS("ermB_ps_fsm.RDS")
+```
+
+# SOIL/RUNOFF SAMPLES
+```{r}
+#subsetting soil/runoff samples
+ermB_ps_soil <- subset_samples(ermB_filt, Sample_Type=="SOIL/RUNOFF")
+
+#checking to see that the right samples have been subsetted
+View(sample_data(ermB_ps_soil))
+
+saveRDS(ermB_ps_soil, file = "ermB_ps_soil.RDS")
+ermB_ps_soil <- readRDS("ermB_ps_soil.RDS")
+```
+
+################################# ANALYSIS BY SAMPLE TYPE
+## RUMEN
+# PCOA + PERMANOVA
+```{r}
+#transform data to proportions
+ermB_rumen.prop <- transform_sample_counts(ermB_ps_rumen, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+ermB_rumen_dist <- phyloseq::distance(ermB_rumen.prop, method="bray")
+
+#making a data frame of sample_data
+ermB_rumen_df <- data.frame(sample_data(ermB_ps_rumen))
+
+#performing permanova
+ermB_rumen_perm <- adonis(t(ermB_rumen_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, 
+                               data = ermB_rumen_df, permutations = 999)
+
+#making table/figure out of the permanova results
+ermB_rumen_permtab <- ermB_rumen_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between rumen microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title = "ermB Rumen Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_rumen_permtab.pdf")
+
+#pairwise comparisons between treatments
+ermB_rumen_pairadonis <- pairwise.adonis(ermB_rumen_dist, ermB_rumen_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+ermB_rumen_pctab <- ermB_rumen_pairadonis %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of rumen microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments. Significance is determined at p < 0.05.",threeparttable = T, general_title = "ermB Rumen Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_rumen_pctab.pdf")
+```
+
+#RUMEN - beta diversity
+
+```{r}
+#perform ordinations
+ermB_rumen.bray <- ordinate(ermB_rumen.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+ermB_rumen_bctreat <- plot_ordination(ermB_rumen.prop, ermB_rumen.bray, color="Treatment") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+ermB_rumen.bctime <- plot_ordination(ermB_rumen.prop, ermB_rumen.bray, color="DayOfStudy") + theme_half_open() + geom_point(size=3) #+ xlab("PC1(9.9%)") + ylab("PC2(9.5%)") 
+
+ermB_rumen_pcoa <- plot_grid(ermB_rumen_bctreat, ermB_rumen.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Rumen_Beta.pdf", width=20, height = 25, units = "cm")
+
+saveRDS(ermB_rumen.bray, "ermB_rumen.bray.RDS")
+```
+
+#RUMEN - alpha diversity
+
+```{r}
+#alpha diversity needs to be performed on raw data
+ermB_rum.uf <- subset_samples(ermB_ps_all, Sample_Type=="RUMEN")
+
+#alpha diversity calc table
+ermB_rum_alpha <- estimate_richness(ermB_rum.uf, measures=c("Shannon", "Observed")) 
+ermB_rum_alpha <- merge(as(sample_data(ermB_rum.uf),"matrix") , ermB_rum_alpha, by=0)
+rownames(ermB_rum_alpha) <- ermB_rum_alpha$Row.names
+
+ermB_rum_obsalpha <- ggplot(data = ermB_rum_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermB_rum_shanalpha <- ggplot(data = ermB_rum_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermB_rum_alphaplot <- plot_grid(ermB_rum_obsalpha, ermB_rum_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/RUM_alpha.pdf", width=20, height = 20, units = "cm")
+
+saveRDS(ermB_rum_alpha, "ermB_rum_alpha.RDS")
+```
+
+#RUMEN - DESEQ heatmap
+
+```{r}
+#phyloseq object that is not normalised!
+ermB_ps_rumen 
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+ermB_rum_dds = phyloseq_to_deseq2(ermB_ps_rumen, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(ermB_rum_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+ermB_rum_dds = estimateSizeFactors(ermB_rum_dds, geoMeans=geoMeans) 
+ermB_rum_dds = DESeq2::DESeq(ermB_rum_dds, test = "Wald", fitType = "local") 
+
+ermB_rumres=DESeq2::results(ermB_rum_dds)
+DESeq2::resultsNames(ermB_rum_dds)
+ermB_rumres=ermB_rumres[order(ermB_rumres$padj, na.last=NA),]
+alpha = 0.05
+
+ermB_rum.st = ermB_rumres[(ermB_rumres$padj < alpha),]
+View(ermB_rum.st)
+write.table(ermB_rum.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_rum_st.tsv", sep = "\t")
+
+#finding top 10 sig diff ASVs
+ermB_rum.top20 <- head(ermB_rum.st, 20)
+
+ermB_rum.df <- as.data.frame(colData(ermB_rum_dds)[c("Treatment", "DayOfStudy")])
+ermB_rum.vsd <- varianceStabilizingTransformation(ermB_rum_dds)
+
+#extract names of differentially abundant ASVs
+names <- as.factor(rownames(ermB_rum.top20))
+
+#make a subset of the log transformed counts for the differentially abundant genes
+ermB_rum.top<-assay(ermB_rum.vsd)
+top20fdiff<- ermB_rum.top[rownames(ermB_rum.top) %in% names, ] 
+
+colnames(ermB_rum.df) <- c("Treatment", "DayOfStudy")
+
+ermB_rum_diffASV <- pheatmap(top20fdiff, scale = "row",
+                                  annotation_col = ermB_rum.df, 
+                                  cluster_rows = T, 
+                                  cluster_cols = F, 
+                                  fontsize_col = 5.5,
+                                  width = 12,
+                                  height = 6,
+                                  clustering_distance_rows = "euclidean",
+                                  fontface_row = "italic",
+                     filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ermB_rum_diffASV.pdf")
+
+saveRDS(ermB_rum_dds, "ermB_rum_dds.RDS")
+```
+
+###DESEQ rumen contrast between AbxFree + Nuflor
+
+```{r}
+#run the algorithm
+#make a results table of the algorithm
+ermB_rumres_AN = DESeq2::results(ermB_rum_dds, contrast=c("Treatment", "AbxFree", "Nuflor")) 
+#shows summary of results
+summary(ermB_rumres_AN) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_rum_stAN = ermB_rumres_AN[which(ermB_rumres_AN$padj < alpha), ] 
+View(ermB_rum_stAN)
+
+#printing row names
+rnames_AN <- rownames(ermB_rum_stAN)
+
+
+ermB_rum_stAN <- data.frame(ermB_rum_stAN)
+write.table(ermB_rum_stAN,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_rum_AN_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+ER_AN <- ggplot(ermB_rum_stAN, aes(x=rnames_AN, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Rumen - Differential ASVs between AbxFree vs Nuflor treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ER_AN.pdf", width = 30, height = 18, units="cm")
+```
+
+#DESEQ rumen contrast between AbxFree + Draxxin
+
+```{r}
+#run the algorithm
+#make a results table of the algorithm
+ermB_rumres_AD = DESeq2::results(ermB_rum_dds, contrast=c("Treatment", "AbxFree", "Draxxin")) 
+#shows summary of results
+View(ermB_rumres_AD) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_rum_stAD = ermB_rumres_AD[which(ermB_rumres_AD$padj < alpha),] 
+View(ermB_rum_stAD)
+
+#printing row names
+rnames_AD <- rownames(ermB_rum_stAD)
+row.names(ermB_rum_stAD) <- rnames_AD
+
+ermB_rum_stAD <- data.frame(ermB_rum_stAD)
+write.table(ermB_rum_stAD,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_rum_AD_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+ER_AD <- ggplot(ermB_rum_stAD, aes(x=rnames_AD, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Rumen - Differential ASVs between AbxFree vs Draxxin treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ER_AD.pdf", width = 30, height = 18, units="cm")
+```
+
+#DESEQ rumen contrast between AbxFree + Excede
+```{r}
+#run the algorithm
+#make a results table of the algorithm
+ermB_rumres_AE = DESeq2::results(ermB_rum_dds, contrast=c("Treatment", "AbxFree", "Excede")) 
+#shows summary of results
+View(ermB_rumres_AE) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_rum_stAE = ermB_rumres_AE[which(ermB_rumres_AE$padj < alpha), ] 
+
+#printing row names
+rnames_AE <- rownames(ermB_rum_stAE)
+row.names(ermB_rum_stAE) <- rnames_AE
+
+#forming a plot of the differential ASVs
+ermB_rum_stAE <- data.frame(ermB_rum_stAE)
+write.table(ermB_rum_stAE,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_rum_AE_sigtab.txt", sep="\t", quote=F)
+
+ER_AE  <- ggplot(ermB_rum_stAE, aes(x=rnames_AE, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Rumen - Differential ASVs between AbxFree vs Excede treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ER_AE.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_rum_stAE, "ermB_rum_stAE.RDS")
+saveRDS(ermB_rumres_AE, "ermB_rumres_AE.RDS")
+```
+
+#DESEQ rumen contrast AbxFree + Baytril
+
+```{r}
+#make a results table of the algorithm
+ermB_rumres_AB = DESeq2::results(ermB_rum_dds, contrast=c("Treatment", "AbxFree", "Baytril")) #
+#shows summary of results
+View(ermB_rumres_AB) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_rum_stAB = ermB_rumres_AB[which(ermB_rumres_AB$padj < alpha), ] 
+View(ermB_rum_stAB)
+
+#printing row names
+rnames_AB <- rownames(ermB_rum_stAB)
+row.names(ermB_rum_stAB) <- rnames_AB
+
+ermB_rum_stAB <- data.frame(ermB_rum_stAB)
+write.table(ermB_rum_stAB,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_rum_AB_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+ER_AB <- ggplot(ermB_rum_stAB, aes(x=rnames_AB, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Rumen - Differential ASVs between AbxFree vs Baytril treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ER_AB.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_rumres_AB, "ermB_rumres_AB.RDS")
+saveRDS(ermB_rum_stAB, "ermB_rum_stAB.RDS")
+```
+
+#forming upset diagram of common rumen ASVs between treatments
+```{r}
+library(UpSetR)
+ermB_rum_common_ASV <- as.vector(list(
+  Nuflor = rnames_AN, 
+  Draxxin = rnames_AD, 
+  Excede = rnames_AE, 
+  Baytril = rnames_AB))
+
+pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/rumen_upset.pdf")
+ermB_rum_upset <- upset(fromList(ermB_rum_common_ASV), 
+                            order.by = "freq", point.size = 3, line.size = 1,
+                            mainbar.y.label = "Differential ASV Intersections", 
+                            sets.x.label = "Antibiotic Treatment", 
+                            text.scale = c(1.3, 1.3, 1, 1, 2, 0.75),
+                            sets.bar.color=c("#ECCBAE", "#046C9A", "#D69C4E", "#ABDDDE"),
+                            matrix.color = "black",
+                            empty.intersections="on") 
+dev.off()
+```
+
+########################################### FECAL ANALYSIS
+
+```{r}
+#proportional data 
+ermB_fecal.prop <- transform_sample_counts(ermB_ps_fecal, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+ermB_fecal_dist <- phyloseq::distance(ermB_fecal.prop, method="bray")
+
+#making a data frame of sample_data
+ermB_fecal_df <- data.frame(sample_data(ermB_ps_fecal))
+
+ermB_fecal_permanova <- adonis(t(ermB_fecal_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, 
+                               data = ermB_fecal_df, permutations = 999)
+
+#making table/figure out of the permanova results
+ermB_fecal_permtab <- ermB_fecal_permanova$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between fecal microbiome samples (999 permutations). The statistical model takes into account day of study, treatment, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="ermB Fecal Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_fecal_permtab.pdf")
+
+#pairwise comparisons between treatments
+ermB_fec_pc <- pairwise.adonis(ermB_fecal_dist, ermB_fecal_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999)
+
+#making table/figure out of the permanova results
+ermB_fec_pctab <- ermB_fec_pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between treatments of fecal microbiome samples (999 permutations). The statistical model performs a pairwise comparison between treatments. Significance is determined at p < 0.05. * denotes significance at p < 0.01.",threeparttable = T, general_title = "ermB Fecal Treatments - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/fecal_pairtab.pdf")
+```
+
+#beta diversity per sample type - FECAL
+
+```{r}
+#perform ordinations on proportional data w/ bray-curtis
+ermB_fecal.ord <- ordinate(ermB_fecal.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+ermB_fecal.bctreat <- plot_ordination(ermB_fecal.prop, ermB_fecal.ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+ermB_fecal.bctime <- plot_ordination(ermB_fecal.prop, ermB_fecal.ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+ermB_fecal_pcoa <- plot_grid(ermB_fecal.bctreat, ermB_fecal.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ermB_Fecal_Beta.pdf", width=20, height = 25, units = "cm")
+```
+
+#FECAL - alpha diversity
+```{r}
+#unfiltered fecal
+ermB_fec.uf <- subset_samples(ermB_ps_all, Sample_Type=="FECAL")
+
+ermB_fec_alpha <- estimate_richness(ermB_fec.uf, measures=c("Shannon", "Observed"))
+ermB_fec_alpha <- merge(as(sample_data(ermB_fec.uf),"matrix") , ermB_fec_alpha, by=0)
+rownames(ermB_fec_alpha) <- ermB_fec_alpha$Row.names
+
+ermB_fec_obsalpha <- ggplot(data = ermB_fec_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+ermB_fec_shanalpha <- ggplot(data = ermB_fec_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermB_fec_alphaplot <- plot_grid(ermB_fec_obsalpha, ermB_fec_shanalpha, labels="AUTO", nrow = 2)
+
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ermB_Fecal_Alpha.pdf", width=20, height = 20, units = "cm")
+```
+
+#FECAL - deseq heatmap
+
+```{r}
+#phyloseq object that is not normalised!
+ermB_ps_fecal
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+ermB_fec_dds = phyloseq_to_deseq2(ermB_ps_fecal, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(ermB_fec_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+ermB_fec_dds = estimateSizeFactors(ermB_fec_dds, geoMeans=geoMeans) 
+ermB_fec_dds = DESeq2::DESeq(ermB_fec_dds, test = "Wald", fitType = "local") 
+
+ermB_fecres=DESeq2::results(ermB_fec_dds)
+DESeq2::resultsNames(ermB_fec_dds)
+ermB_fecres=ermB_fecres[order(ermB_fecres$padj, na.last=NA),]
+alpha = 0.05
+
+ermB_fec.st = ermB_fecres[(ermB_fecres$padj < alpha),]
+View(ermB_fec.st)
+write.table(ermB_fec.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_fec_st.tsv", sep = "\t")
+
+#finding top 10 sig diff ASVs
+ermB_fec.top20 <- head(ermB_fec.st, 20)
+
+ermB_fec.df <- as.data.frame(colData(ermB_fec_dds)[c("Treatment", "DayOfStudy")])
+ermB_fec.vsd <- varianceStabilizingTransformation(ermB_fec_dds)
+
+#extract names of differentially abundant ASVs
+names20 <- as.factor(rownames(ermB_fec.top20))
+
+#make a subset of the log transformed counts for the differentially abundant genes
+ermB_fec.top<-assay(ermB_fec.vsd)
+top20fdiff<- ermB_fec.top[rownames(ermB_fec.top) %in% names20, ] 
+
+colnames(ermB_fec.df) <- c("Treatment", "DayOfStudy")
+
+ermB_fec_diffASV <- pheatmap(top20fdiff, scale = "row",
+                                  annotation_col = ermB_fec.df, 
+                                  cluster_rows = T, 
+                                  cluster_cols = F, 
+                                  fontsize_col = 5.5,
+                                  width = 13,
+                                  height = 6,
+                                  fontface_row = "italic",
+                     filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ermB_fec_diffASV.pdf")
+```
+
+#FECAL - DESEQ contrast AbxFree vs Baytril
+```{r}
+#make a results table of the algorithm
+ermB_fecres_AB = DESeq2::results(ermB_fec_dds, contrast=c("Treatment", "AbxFree", "Baytril")) #
+#shows summary of results
+View(ermB_fecres_AB) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_fec_stAB = ermB_fecres_AB[which(ermB_fecres_AB$padj < alpha), ] 
+View(ermB_fec_stAB)
+
+#printing row names
+rnames_AB <- rownames(ermB_fec_stAB)
+row.names(ermB_fec_stAB) <- rnames_AB
+
+ermB_fec_stAB <- data.frame(ermB_fec_stAB)
+write.table(ermB_fec_stAB,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/fecal_AB_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+EF_AB <- ggplot(ermB_fec_stAB, aes(x=rnames_AB, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Fecal - Differential ASVs between AbxFree vs Baytril treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Fecal_AB.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_fecres_AB, "ermB_fecres_AB.RDS")
+saveRDS(ermB_fec_stAB, "ermB_fec_stAB.RDS")
+```
+
+# FECAL - DESEQ contrast AbxFree vs Draxxin
+
+```{r}
+#make a results table of the algorithm
+ermB_fecres_AD = DESeq2::results(ermB_fec_dds, contrast=c("Treatment", "AbxFree", "Draxxin")) 
+#shows summary of results
+View(ermB_fecres_AD) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_fec_stAD = ermB_fecres_AD[which(ermB_fecres_AD$padj < alpha), ] 
+
+#printing row names
+rnames_AD <- rownames(ermB_fec_stAD)
+row.names(ermB_fec_stAD) <- rnames_AD
+
+ermB_fec_stAD <- data.frame(ermB_fec_stAD)
+write.table(ermB_fec_stAD,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/Fecal_AD_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+EF_AD <- ggplot(ermB_fec_stAD, aes(x=rnames_AD, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Fecal - Differential ASVs between AbxFree vs Draxxin treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Fecal_AD.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_fecres_AD, "ermB_fecres_AD.RDS")
+saveRDS(ermB_fec_stAD, "ermB_fec_stAD.RDS")
+```
+
+#FECAL - DESEQ contrast AbxFree vs Excede
+
+```{r}
+#make a results table of the algorithm
+ermB_fecres_AE = DESeq2::results(ermB_fec_dds, contrast=c("Treatment", "AbxFree", "Excede")) 
+#shows summary of results
+View(ermB_fecres_AE) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_fec_stAE = ermB_fecres_AE[which(ermB_fecres_AE$padj < alpha), ] 
+
+#printing row names
+rnames_AE <- rownames(ermB_fec_stAE)
+row.names(ermB_fec_stAE) <- rnames_AE
+
+ermB_fec_stAE <- data.frame(ermB_fec_stAE)
+write.table(ermB_fec_stAE,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/Fecal_AE_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+EF_AE <- ggplot(ermB_fec_stAE, aes(x=rnames_AE, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Fecal - Differential ASVs between AbxFree vs Excede treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Fecal_AE.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_fecres_AE, "ermB_fecres_AE.RDS")
+saveRDS(ermB_fec_stAE, "ermB_fec_stAE.RDS")
+```
+
+#FECAL - DESEQ contrast AbxFree vs Nuflor
+
+```{r}
+#make a results table of the algorithm
+ermB_fecres_AN = DESeq2::results(ermB_fec_dds, contrast=c("Treatment", "AbxFree", "Nuflor")) 
+#shows summary of results
+View(ermB_fecres_AN) 
+#create a metric to filter your results
+alpha = 0.05 
+#filter out asvs from the result table that do not meet alpha
+ermB_fec_stAN = ermB_fecres_AN[which(ermB_fecres_AN$padj < alpha), ] 
+
+#printing row names
+rnames_AN <- rownames(ermB_fec_stAN)
+row.names(ermB_fec_stAN) <- rnames_AN
+
+ermB_fec_stAN <- data.frame(ermB_fec_stAN)
+write.table(ermB_fec_stAN,"/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/Fecal_AN_sigtab.txt", sep="\t", quote=F)
+
+#forming a plot of the differential ASVs
+EF_AN <- ggplot(ermB_fec_stAN, aes(x=rnames_AN, y=log2FoldChange, color=padj)) + geom_point(size=6) + scale_colour_gradient(low = "#446455", high = "#FDD262") + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5), axis.text = element_text(size = 10), axis.title=element_text(size=10), legend.position="right", legend.direction = "vertical", legend.text=element_text(size=10)) + ggtitle("ermB Fecal - Differential ASVs between AbxFree vs Nuflor treatments") 
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Fecal_AN.pdf", width = 30, height = 18, units="cm")
+
+saveRDS(ermB_fecres_AN, "ermB_fecres_AN.RDS")
+saveRDS(ermB_fec_stAN, "ermB_fec_stAN.RDS")
+```
+
+# UPSET plot
+```{r}
+ermB_fec_common_ASV <- as.vector(list(
+  Nuflor = rnames_AN, 
+  Draxxin = rnames_AD, 
+  Excede = rnames_AE, 
+  Baytril = rnames_AB))
+
+pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/fecal_upset.pdf")
+ermB_fec_upset <- upset(fromList(ermB_fec_common_ASV), 
+                            order.by = "freq", point.size = 3, line.size = 1,
+                            mainbar.y.label = "Differential ASV Intersections", 
+                            sets.x.label = "Antibiotic Treatment", 
+                            text.scale = c(1.3, 1.3, 1, 1, 2, 0.75),
+                            sets.bar.color=c("#ECCBAE", "#046C9A", "#D69C4E", "#ABDDDE"),
+                            matrix.color = "black",
+                            empty.intersections="on") 
+dev.off()
+```
+
+############################################ SOIL ANALYSIS
+#PERMANOVA
+```{r}
+#transform to proportional data
+ermB_soil.prop <- transform_sample_counts(ermB_ps_soil, function(x)x/sum(x))
+
+#calculating bray curtis distance matrix
+ermB_soil_dist <- phyloseq::distance(ermB_soil.prop, method="bray")
+
+#making a data frame of sample_data
+ermB_soil_df <- data.frame(sample_data(ermB_ps_soil))
+
+ermB_soil_perm <- adonis(t(ermB_soil_dist) ~Treatment + DayOfStudy + Treatment*DayOfStudy, data = ermB_soil_df, permutations = 999)
+
+#making table/figure out of the permanova results
+ermB_soil_permtab <- ermB_soil_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_soil_permtab.pdf")
+
+#pairwise comparisons between treatments
+ermB_soil_pctreat <- pairwise.adonis(ermB_soil_dist, ermB_soil_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999)
+
+ermB_soil_pctab <- ermB_soil_pctreat %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/soiltreat_pctab.pdf")
+
+#pairwise comparisons between timepoints
+ermB_soil_pctp <- pairwise.adonis(ermB_soil_dist, ermB_soil_df$DayOfStudy, sim.method = "bray", p.adjust.m = "BH", perm = 999)
+
+ermB_soil_pctime <- ermB_soil_pctp %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/soiltime_pctab.pdf")
+```
+
+#BETA DIVERSITY PLOT
+```{r}
+#perform ordinations on proportional data w/ bray-curtis
+ermB_soil.ord <- ordinate(ermB_soil.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+ermB_soil.bctreat <- plot_ordination(ermB_soilro.prop, ermB_soil.ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+ermB_soil.bctime <- plot_ordination(ermB_soilro.prop, ermB_soil.ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+ermB_soil_pcoa <- plot_grid(ermB_soil.bctreat, ermB_soil.bctime, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Soil_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#ALPHA DIVERSITY - baseline timepoint
+```{r}
+ermB_soil.uf <- subset_samples(ermB_ps_all, Sample_Type=="SOIL/RUNOFF")
+ermB_soil_base <- subset_samples(ermB_soil.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+ermB_sba <- estimate_richness(ermB_soil_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+ermB_sba<- merge(as(sample_data(ermB_soil_base),"matrix") , ermB_sba, by=0)
+rownames(ermB_sba) <- ermB_sba$Row.names
+
+ermBsoilbase_obs <- ggplot(data = ermB_sba, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+ermBsoilbase_shan <- ggplot(data = ermB_sba, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+
+#alpha diversity only at days 172, 196, 226
+ermB_soil.tg <- subset_samples(ermB_soil.uf, DayOfStudy!="Day_0")
+
+ermB_soil_alp <- estimate_richness(ermB_soil.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+ermB_soil_alp<- merge(as(sample_data(ermB_soil.tg),"matrix") , ermB_soil_alp, by=0)
+rownames(ermB_soil_alp) <- ermB_soil_alp$Row.names
+
+ermBs_tg_obsalp <- ggplot(data = ermB_soil_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+ermBs_tg_shanalp <- ggplot(data = ermB_soil_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermBsoil_all <- plot_grid(ermBsoilbase_obs,ermBsoilbase_shan,ermBs_tg_obsalp, ermBs_tg_shanalp, labels="AUTO", nrow = 2, ncol=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/SOIL_ALL_CombAlpha.pdf", width=35, height = 30, units = "cm")
+```
+
+################################### FSM #############################
+#BETA
+```{r}
+#BETA
+ermB_fsm.prop <- transform_sample_counts(ermB_ps_fsm, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+ermB_fsm_ord <- ordinate(ermB_fsm.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+ermB_fsm_treat <- plot_ordination(ermB_fsm.prop, ermB_fsm_ord, color="Treatment") + theme_half_open()  + geom_point(size=3) 
+ermB_fsm_time <- plot_ordination(ermB_fsm.prop, ermB_fsm_ord, color="DayOfStudy") + theme_half_open()  + geom_point(size=3) 
+
+fsm_pcoa <- plot_grid(ermB_fsm_treat, ermB_fsm_time, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/FSM_Beta.pdf", width=20, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+ermB_fsm_dist <- phyloseq::distance(ermB_fsm.prop, method="bray")
+
+#making a data frame of sample_data
+ermB_fsm_df <- data.frame(sample_data(ermB_ps_fsm))
+
+ermB_fsm_perm <- adonis(t(ermB_fsm_dist) ~Treatment + DayOfStudy + DayOfStudy*Treatment,data = ermB_fsm_df, permutations = 999)
+
+#making table/figure out of the permanova results
+ermB_fsm_permtab <- ermB_fsm_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_fsm_permtab.pdf")
+
+#pairwise comparisons between treatments
+ermB_fsm.pc <- pairwise.adonis(ermB_fsm_dist, ermB_fsm_df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+ermB_fsm.pctab <- ermB_fsm.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+ save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_fsm_pctreat.pdf")
+
+#pairwise comparisons between timepoints
+ermB_fsm.pctime <- pairwise.adonis(ermB_fsm_dist, ermB_fsm_df$DayOfStudy, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#making table/figure out of the permanova results
+ermB_fsm.pctimetab <- ermB_fsm.pctime %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+  save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_fsm_pctime.pdf")
+```
+
+## alpha diversity
+```{r}
+ermB_fsm.uf <- subset_samples(ermB_ps_all, Sample_Type=="FSM")
+ermB_fsm_base <- subset_samples(ermB_fsm.uf, DayOfStudy=="Day_0")
+
+#perform alpha diversity on phyloseq object before prevalence filtering
+ermB_base_a <- estimate_richness(ermB_fsm_base, measures=c("Shannon", "Observed")) #alpha diversity calc table
+ermB_base_a<- merge(as(sample_data(ermB_fsm_base),"matrix") , ermB_base_a, by=0)
+rownames(ermB_base_a) <- ermB_base_a$Row.names
+
+ermBbase_obsalp <- ggplot(data = ermB_base_a, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+ermBbase_shanalp <- ggplot(data = ermB_base_a, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) 
+
+#alpha diversity only at days 141, 151
+ermB_fsm.tg <- subset_samples(ermB_fsm.uf, DayOfStudy!="Day_0")
+
+ermB_fsm_alp <- estimate_richness(ermB_fsm.tg, measures=c("Shannon", "Observed")) #alpha diversity calc table
+ermB_fsm_alp<- merge(as(sample_data(ermB_fsm.tg),"matrix") , ermB_fsm_alp, by=0)
+rownames(ermB_fsm_alp) <- ermB_fsm_alp$Row.names
+
+ermBfsm_tg_obsalp <- ggplot(data = ermB_fsm_alp, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+ermBfsm_tg_shanalp <- ggplot(data = ermB_fsm_alp, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermBfsm_all <- plot_grid(ermBbase_obsalp,ermBbase_shanalp,ermBfsm_tg_obsalp, ermBfsm_tg_shanalp, labels="AUTO", nrow = 2, ncol=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/FSM_ALL_CombAlpha.pdf", width=30, height = 25, units = "cm")
+```
+
+## deseq heatmap
+```{r}
+ermB_fsm.uf
+ermB_fsm_dds = phyloseq_to_deseq2(ermB_fsm.uf, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(ermB_fsm_dds), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+ermB_fsm_dds = estimateSizeFactors(ermB_fsm_dds, geoMeans=geoMeans) 
+ermB_fsm_dds = DESeq2::DESeq(ermB_fsm_dds, test = "Wald", fitType = "local") 
+
+ermB_fsmres=DESeq2::results(ermB_fsm_dds)
+DESeq2::resultsNames(ermB_fsm_dds)
+ermB_fsmres=ermB_fsmres[order(ermB_fsmres$padj, na.last=NA),]
+alpha = 0.05
+
+ermB_fsm.st = ermB_fsmres[(ermB_fsmres$padj < alpha),]
+View(ermB_fsm.st)
+write.table(ermB_fsm.st, file = "/Users/arenasee/Desktop/grad_school/AMR_project/ermB_analysis/ermB_fsm_st.tsv", sep = "\t")
+
+ermB_fsm.df <- as.data.frame(colData(ermB_fsm_dds)[c("Treatment", "DayOfStudy")])
+ermB_fsm.vsd <- varianceStabilizingTransformation(ermB_fsm_dds)
+
+#make a subset of the log transformed counts for the differentially abundant genes
+ermB_fsm.top<-assay(ermB_fsm.vsd)
+
+
+```
+
+
+####### ALL SAMPLE ANALYSIS
+# heatmap - ASV abundance
+```{r}
+pdf("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ASV_abund_HM.pdf", height = 10, width = 5)
+p <- plot_heatmap(ermB_filt)
+p <- p + theme(legend.position = "right", legend.direction="vertical") 
+dev.off()
+```
+
+#ASV abundance pheatmap
+```{r}
+ermB_filt <- readRDS("ermB_filt.RDS")
+ermB.s <- set_sample_order(ermB_filt, sort_on=c("Sample_Type", "DayOfStudy"))
+
+ermB.norm <- transform_sample_counts(ermB.s, function(x)x/sum(x))
+
+#turn asv table into matrix
+ermB.mat <- as.matrix(otu_table(ermB.norm))
+
+ermB_df <- data.frame(sample_data(ermB.norm))
+
+#remove all cols except sample type/day of study
+ermB_df <- ermB_df[, c(4,5)]
+
+colnames(ermB_df) <- c("Sample_Type", "DayOfStudy")
+
+tetw_df$DayOfStudy <- factor(tetw_df$DayOfStudy, levels = c("Day_0", "Day_42", "Day_141", "Day_154", "Day_172", "Day_196", "Day_226"))
+
+ermB_pheat <- pheatmap(ermB.mat, scale = "row",
+                            annotation_col = ermB_df,
+                            gaps_col = c(134, 190,334),
+                           cluster_rows = T, 
+                            cluster_cols = F, 
+                            show_rownames=T,
+                           cutree_rows = 4,
+                            fontsize_col = 7,
+                       width = 25,
+                       height = 20, 
+                          clustering_distance_rows = "euclidean",
+                         fontface_row = "italic",
+                       filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/pheatmap.pdf")
+
+```
+
+
+
+
+# bray curtis
+```{r}
+#transform data to proportions
+ermB_all.prop <- transform_sample_counts(ermB_filt, function(x)x/sum(x))
+
+#perform ordinations on proportional data w/ bray-curtis
+eb_ord <- ordinate(ermB_all.prop, method="PCoA", distance="bray")
+
+#PCoA using Bray-Curtis distances
+ermB_treat <- plot_ordination(ermB_all.prop, eb_ord, color="Treatment") + theme_half_open()  + geom_point(size=3)
+ermB_sample <- plot_ordination(ermB_all.prop, eb_ord, color="Sample_Type") + theme_half_open()  + geom_point(size=3) 
+
+ermB_all_pcoa <- plot_grid(ermB_treat, ermB_sample, labels=c('A', 'B'),nrow=2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/AllSamples_Beta.pdf", width=25, height = 20, units = "cm")
+```
+
+#permanova
+```{r}
+#calculating bray curtis distance matrix
+ermB_dist <- phyloseq::distance(ermB_all.prop, method="bray")
+
+#making a data frame of sample_data
+ermB.df <- data.frame(sample_data(ermB_filt))
+
+ermB_perm <- adonis(t(ermB_dist) ~Treatment + Sample_Type + Treatment*Sample_Type,data = ermB.df, permutations = 999)
+
+#making table/figure out of the permanova results
+ermB_permtab <- ermB_perm$aov.tab %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Times") %>%
+footnote(general = "Permutational multivariate analysis of variance based on Bray-Curtis distances between all microbiome samples (999 permutations). The statistical model takes into account treatment, sample type, and the interaction between them. Significance is determined at p < 0.05.",threeparttable = T, general_title ="ermB All Samples Bray-Curtis Permanova ", title_format =c("bold")) %>%
+      save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_all_permtab.pdf")
+
+#pairwise comparisons between treatments
+ermB_treat.pc <- pairwise.adonis(ermB_dist, ermB.df$Treatment, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+#pairwise comparisons between sample types
+ermB_samp.pc <- pairwise.adonis(ermB_dist, ermB.df$Sample_Type, sim.method = "bray", p.adjust.m = "BH", perm = 999) #p.adjust can be any adjustment method for p-value e.g. "BH"
+
+ermB_samp.pctab <- ermB_samp.pc %>%
+                        kbl() %>%
+                        kable_classic(full_width = F, html_font = "Cambria") %>%
+footnote(general_title = "ermB Sample Types - Pairwise PERMANOVA ", title_format =c("bold")) %>%
+        save_kable("/Users/arenasee/Desktop/grad_school/Thesis/Tables/ermB_all_pctab.pdf")
+```
+
+#alpha diversity -
+```{r}
+ermB_alpha <- estimate_richness(ermB_phylobj, measures=c("Shannon", "Observed"))
+ermB_alpha <- merge(as(sample_data(ermB_phylobj),"matrix") , ermB_alpha, by=0)
+rownames(ermB_alpha) <- ermB_alpha$Row.names
+
+ermb_obsalpha <- ggplot(data = ermB_alpha, aes(x=DayOfStudy, y=Observed, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+ermb_shanalpha <- ggplot(data = ermB_alpha, aes(x=DayOfStudy, y=Shannon, fill=Treatment)) + geom_boxplot() + scale_fill_manual(values = pal3) + stat_compare_means(method="kruskal.test")
+
+ermB_fec_alphaplot <- plot_grid(ermB_fec_obsalpha, ermB_fec_shanalpha, labels="AUTO", nrow = 2)
+ggsave("/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/Fecal_Alpha.pdf", width=20, height = 20, units = "cm")
+```
+
+## DIFF ABUNDANCE HEATMAP
+```{r}
+#phyloseq object that is not normalised!
+ermB_ps_all <- readRDS("ermB_ps_all.RDS")
+
+#setting sample order 
+ermB.sort <- set_sample_order(ermB_ps_all, sort_on=c("Sample_Type", "Treatment"))
+
+##create an object that will tell deseq what to compare, in this case Breed, you will want to change this to Treatment, then Timepoint
+eb_dds_tr = phyloseq_to_deseq2(ermB.sort, ~Treatment) 
+#calculate geometric means of your read counts, this is a function from above
+geoMeans = apply(counts(eb_dds_tr), 1, gm_mean) 
+#estimate size factors for each sample so you can compare between samples
+eb_dds_tr = estimateSizeFactors(eb_dds_tr, geoMeans=geoMeans) 
+eb_dds_tr = DESeq2::DESeq(eb_dds_tr, test = "Wald", fitType = "local") 
+
+ermb_res=DESeq2::results(eb_dds_tr)
+DESeq2::resultsNames(eb_dds_tr)
+ermb_res=ermb_res[order(ermb_res$padj, na.last=NA),]
+alpha = 0.05
+
+ermb_treat.st = ermb_res[(ermb_res$padj < alpha),]
+View(ermb_treat.st)
+write.table(ermb_treat.st, file = "DESEQ_treat_sigtab.tsv", sep = "\t")
+
+ermb_tr_df <- as.data.frame(colData(eb_dds_tr)[c("Treatment", "Sample_Type")])
+ermb_tr.vsd <- varianceStabilizingTransformation(eb_dds_tr)
+ermb_tr.prop <- as(otu_table(transform_sample_counts(ermB_ps_all, function(x) x/sum(x))), "matrix")
+View(ermb_tr.prop)
+
+#finding top 20 sig diff ASVs
+ermb_top20.tr <- head(ermb_treat.st, 20)
+
+#extract names of differentially abundant ASVs
+ermB_top20names <- as.factor(rownames(ermb_top20.tr))
+
+#make a subset of the log transformed counts for the differentially abundant genes
+ermb_top<-assay(ermb_tr.vsd)
+top20_diff<- ermb_top[rownames(ermb_tr.prop) %in% ermB_top20names, ] 
+
+#plotting a heatmap using the differentially abundant genes using the package 'pheatmap'
+tax_vector2 <- top20_diff[12]
+
+colnames(ermb_tr_df) <- c("Treatment", "Sample_Type")
+
+#specifying colors for treatment groups for better readability
+annot_colors=list(Treatment=c(AbxFree="#0073C2",AbxTreated="#EFC000",Baseline="#868686", Baytril="#CD534C", Draxxin="#7AA6DC", Excede="#003C67", NoAnimal_Control="#8F7700", Nuflor="#3B3B3B"))
+                  
+ermB_diffASVs_plot <- pheatmap(top20_diff, scale = "row",
+                                  annotation_col = ermb_tr_df, 
+                                 cluster_rows = T, 
+                                  cluster_cols = F, 
+                                  fontsize_col = 5.5,
+                                  width = 25,
+                                  height = 8,
+                                  fontface_row = "italic",
+                         filename="/Users/arenasee/Desktop/grad_school/Thesis/Figures/ermB/ermB_all_diffASV.pdf")
+```
